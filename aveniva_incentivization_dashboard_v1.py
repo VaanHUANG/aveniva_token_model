@@ -989,6 +989,24 @@ RAFFLE_DEFAULT_PROFILES = [
 ]
 
 
+def fmt_ava(v: float, decimals_k: int = 1, decimals_m: int = 2) -> str:
+    """
+    Format a raw $AVA token amount with K (thousand) / M (million) units.
+    Only uses M above 1,000,000; K between 1,000 and 1,000,000; raw below 1,000.
+        850        -> '850'
+        14_896     -> '14.9K'
+        200_000    -> '200.0K'
+        1_250_000  -> '1.25M'
+    """
+    v = float(v)
+    a = abs(v)
+    if a >= 1_000_000:
+        return f"{v / 1e6:.{decimals_m}f}M"
+    if a >= 1_000:
+        return f"{v / 1e3:.{decimals_k}f}K"
+    return f"{v:,.0f}"
+
+
 def pity_eligible_fraction(p_win: float) -> float:
     """
     Stationary fraction of committers in pity-state 3 (C6 §8.2).
@@ -1004,11 +1022,16 @@ def compute_raffle_month(
     commit_rate_pct: float,
     avg_tickets_per_committer: float,
     raffle_pool_tokens: float,
+    mid_floor: int = RAFFLE_MID_FLOOR,
+    mid_ceil: int = RAFFLE_MID_CEIL,
+    cons_floor: int = RAFFLE_CONS_FLOOR,
+    cons_ceil: int = RAFFLE_CONS_CEIL,
 ) -> dict:
     """
     Resolve one monthly draw: tier winners, per-prize amounts, pool T, odds,
     and pity load. Pure function of the row inputs + the monthly raffle pool.
 
+    Winner floor/ceiling per tier are user-parametric (defaults from the C6 spec).
     Returns a flat dict of all quantities (one simulation row).
     """
     n_active = max(0.0, n_users * commit_rate_pct / 100.0)          # committers
@@ -1028,7 +1051,7 @@ def compute_raffle_month(
     excess += max(0.0, jackpot_budget - jackpot_perprize)
 
     # ---- Mid tier ----
-    mid_winners = int(min(max(round(RAFFLE_MID_COEF * n_active), RAFFLE_MID_FLOOR), RAFFLE_MID_CEIL))
+    mid_winners = int(min(max(round(RAFFLE_MID_COEF * n_active), mid_floor), mid_ceil))
     mid_perprize = mid_budget / max(mid_winners, 1)
     if mid_perprize > RAFFLE_MID_PP_CEIL:
         excess += (mid_perprize - RAFFLE_MID_PP_CEIL) * mid_winners
@@ -1038,7 +1061,7 @@ def compute_raffle_month(
         mid_winners = int(mid_budget // mid_perprize)
 
     # ---- Consolation tier (formula-only, before pity) ----
-    cons_target = int(min(max(round(RAFFLE_CONS_COEF * n_active), RAFFLE_CONS_FLOOR), RAFFLE_CONS_CEIL))
+    cons_target = int(min(max(round(RAFFLE_CONS_COEF * n_active), cons_floor), cons_ceil))
     cons_winners_formula = cons_target
     cons_perprize_formula = cons_budget / max(cons_winners_formula, 1)
     if cons_perprize_formula > RAFFLE_CONS_PP_CEIL:
@@ -1056,10 +1079,10 @@ def compute_raffle_month(
 
     # ---- Pity load (C6 §8): eligibles served first, priority placement ----
     pity_frac = pity_eligible_fraction(p_avg)
-    n_pity = min(n_active * pity_frac, float(RAFFLE_CONS_CEIL))
+    n_pity = min(n_active * pity_frac, float(cons_ceil))
 
     # Consolation winners with pity: max(formula target, pity count), ceiling-bound.
-    cons_winners_pity = int(min(max(cons_target, n_pity), RAFFLE_CONS_CEIL))
+    cons_winners_pity = int(min(max(cons_target, n_pity), cons_ceil))
     cons_perprize_pity = cons_budget / max(cons_winners_pity, 1)
     if cons_perprize_pity < RAFFLE_CONS_PP_FLOOR:
         cons_perprize_pity = float(RAFFLE_CONS_PP_FLOOR)
@@ -1106,6 +1129,10 @@ def run_raffle_simulation(
     grid_df: pd.DataFrame,
     profiles_df: pd.DataFrame,
     raffle_pool_tokens: float,
+    mid_floor: int = RAFFLE_MID_FLOOR,
+    mid_ceil: int = RAFFLE_MID_CEIL,
+    cons_floor: int = RAFFLE_CONS_FLOOR,
+    cons_ceil: int = RAFFLE_CONS_CEIL,
 ) -> pd.DataFrame:
     """
     Build the month-by-month raffle simulation from the editable grid.
@@ -1119,6 +1146,8 @@ def run_raffle_simulation(
             commit_rate_pct   = float(g["Commit Rate %"]),
             avg_tickets_per_committer = avg_tix,
             raffle_pool_tokens = raffle_pool_tokens,
+            mid_floor=mid_floor, mid_ceil=mid_ceil,
+            cons_floor=cons_floor, cons_ceil=cons_ceil,
         )
         rec["Month"]     = int(g["Month"])
         rec["New Scans"] = int(g.get("New Scans", 0))
@@ -1129,33 +1158,36 @@ def run_raffle_simulation(
 
 # ---- Raffle chart functions -------------------------------------------------
 
-def fig_raffle_tokens(rdf: pd.DataFrame) -> go.Figure:
-    """Monthly raffle tokens: awarded to winners (by tier) vs excess/rollover."""
-    jackpot = rdf["Jackpot Winners"] * rdf["Jackpot Per-Prize"] / 1e6
-    mid     = rdf["Mid Winners"]     * rdf["Mid Per-Prize"]     / 1e6
-    cons    = rdf["Cons Winners (pity)"] * rdf["Cons Per-Prize (pity)"] / 1e6
+def fig_raffle_tokens(rdf: pd.DataFrame, raffle_pct: float) -> go.Figure:
+    """Monthly raffle tokens (raw $AVA): awarded to winners by tier vs excess/rollover."""
+    jackpot = rdf["Jackpot Winners"]     * rdf["Jackpot Per-Prize"]
+    mid     = rdf["Mid Winners"]         * rdf["Mid Per-Prize"]
+    cons    = rdf["Cons Winners (pity)"] * rdf["Cons Per-Prize (pity)"]
+    excess  = rdf["Excess (M)"] * 1e6
+    pool    = rdf["Pool (M)"]   * 1e6
+
+    def hov(series, label):
+        return [f"{label}: {fmt_ava(v)} $AVA" for v in series]
 
     fig = go.Figure()
-    fig.add_trace(go.Bar(x=rdf["Month"], y=jackpot, name="Jackpot",
-                         marker_color=COLORS["raffle"],
-                         hovertemplate="Jackpot: %{y:.3f}M<extra></extra>"))
-    fig.add_trace(go.Bar(x=rdf["Month"], y=mid, name="Mid",
-                         marker_color=COLORS["mms"],
-                         hovertemplate="Mid: %{y:.3f}M<extra></extra>"))
-    fig.add_trace(go.Bar(x=rdf["Month"], y=cons, name="Consolation",
-                         marker_color=COLORS["quests"],
-                         hovertemplate="Consolation: %{y:.3f}M<extra></extra>"))
-    fig.add_trace(go.Bar(x=rdf["Month"], y=rdf["Excess (M)"], name="Excess / buffer → rollover",
+    fig.add_trace(go.Bar(x=rdf["Month"], y=jackpot, name="Jackpot", marker_color=COLORS["raffle"],
+                         customdata=hov(jackpot, "Jackpot"), hovertemplate="%{customdata}<extra></extra>"))
+    fig.add_trace(go.Bar(x=rdf["Month"], y=mid, name="Mid", marker_color=COLORS["mms"],
+                         customdata=hov(mid, "Mid"), hovertemplate="%{customdata}<extra></extra>"))
+    fig.add_trace(go.Bar(x=rdf["Month"], y=cons, name="Consolation", marker_color=COLORS["quests"],
+                         customdata=hov(cons, "Consolation"), hovertemplate="%{customdata}<extra></extra>"))
+    fig.add_trace(go.Bar(x=rdf["Month"], y=excess, name="Excess / buffer → rollover",
                          marker_color=COLORS["neutral"], opacity=0.6,
-                         hovertemplate="Excess: %{y:.3f}M<extra></extra>"))
-    fig.add_trace(go.Scatter(x=rdf["Month"], y=rdf["Pool (M)"], mode="lines",
-                             name="Total pool (7% MVT)",
+                         customdata=hov(excess, "Excess"), hovertemplate="%{customdata}<extra></extra>"))
+    fig.add_trace(go.Scatter(x=rdf["Month"], y=pool, mode="lines",
+                             name=f"Total pool ({raffle_pct:.0f}% of MVT)",
                              line=dict(color=COLORS["floor"], dash="dash", width=2),
-                             hovertemplate="Pool: %{y:.3f}M<extra></extra>"))
+                             customdata=hov(pool, "Pool"), hovertemplate="%{customdata}<extra></extra>"))
     fig.update_layout(
         barmode="stack",
-        title="Monthly Raffle Tokens Distributed by Tier  (pool fixed at 7% of MVT)",
-        xaxis_title="Month", yaxis_title="$AVA (millions)",
+        title=f"Monthly Raffle Tokens Distributed by Tier  (pool = {raffle_pct:.0f}% of MVT, set in sidebar)",
+        xaxis_title="Month", yaxis_title="$AVA",
+        yaxis=dict(tickformat="~s"),
         legend=dict(orientation="h", y=-0.25),
         margin=dict(t=55, b=90, l=65, r=20), height=420,
     )
@@ -1175,10 +1207,12 @@ def fig_prize_tiers(rdf: pd.DataFrame) -> go.Figure:
 
     fig.add_trace(go.Scatter(x=rdf["Month"], y=rdf["Mid Per-Prize"], mode="lines+markers",
                              name="Mid per-prize", line=dict(color=COLORS["mms"], width=2.5),
-                             hovertemplate="Mid per-prize: %{y:,.0f} $AVA<extra></extra>"), secondary_y=True)
+                             customdata=[f"Mid per-prize: {fmt_ava(v)} $AVA" for v in rdf["Mid Per-Prize"]],
+                             hovertemplate="%{customdata}<extra></extra>"), secondary_y=True)
     fig.add_trace(go.Scatter(x=rdf["Month"], y=rdf["Cons Per-Prize (pity)"], mode="lines+markers",
                              name="Cons per-prize", line=dict(color=COLORS["quests"], width=2.5),
-                             hovertemplate="Cons per-prize: %{y:,.0f} $AVA<extra></extra>"), secondary_y=True)
+                             customdata=[f"Cons per-prize: {fmt_ava(v)} $AVA" for v in rdf["Cons Per-Prize (pity)"]],
+                             hovertemplate="%{customdata}<extra></extra>"), secondary_y=True)
 
     fig.add_hline(y=RAFFLE_MID_PP_FLOOR, line_dash="dot", line_color=COLORS["mms"], opacity=0.4,
                   annotation_text="Mid floor 600", annotation_position="top left", secondary_y=True)
@@ -1186,7 +1220,7 @@ def fig_prize_tiers(rdf: pd.DataFrame) -> go.Figure:
                   annotation_text="Cons floor 80", annotation_position="bottom left", secondary_y=True)
 
     fig.update_yaxes(title_text="Winners per draw", secondary_y=False)
-    fig.update_yaxes(title_text="Per-prize $AVA", secondary_y=True)
+    fig.update_yaxes(title_text="Per-prize $AVA", tickformat="~s", secondary_y=True)
     fig.update_layout(
         barmode="group",
         title="Prize Tier Structure vs Participation  (winners scale with N_active; per-prize dilutes)",
@@ -1215,9 +1249,12 @@ def fig_tickets_farmed_committed(rdf: pd.DataFrame) -> go.Figure:
     return fig
 
 
-def fig_win_prob_curve(rdf: pd.DataFrame) -> go.Figure:
-    """P(win ≥1) and per-tier odds vs committed tickets x, using the last month's pool."""
-    last = rdf.iloc[-1]
+def fig_win_prob_curve(rdf: pd.DataFrame, ref_month: int = None) -> go.Figure:
+    """P(win ≥1) and per-tier odds vs committed tickets x, for the chosen month's pool."""
+    if ref_month is not None and (rdf["Month"] == ref_month).any():
+        last = rdf[rdf["Month"] == ref_month].iloc[0]
+    else:
+        last = rdf.iloc[-1]
     T = max(last["Total Tickets T"], 1)
     W = last["W (winner slots)"]
     mid_w  = last["Mid Winners"]
@@ -1244,7 +1281,9 @@ def fig_win_prob_curve(rdf: pd.DataFrame) -> go.Figure:
                   annotation_text=f"avg committer ≈ {int(last['Avg Tickets/Committer']):,}",
                   annotation_position="top right")
     fig.update_layout(
-        title=f"Win Probability vs Committed Tickets  (last month: N_active={int(last['N Active']):,}, T={last['Total Tickets T']/1e6:.1f}M)",
+        title=(f"Win Probability vs Committed Tickets  "
+               f"(Month {int(last['Month'])}: N_active={int(last['N Active']):,}, "
+               f"T={fmt_ava(last['Total Tickets T'])} tickets, W={int(last['W (winner slots)']):,} slots)"),
         xaxis_title="Tickets committed by a user (x)", yaxis_title="Probability (%)",
         legend=dict(orientation="h", y=-0.25),
         margin=dict(t=55, b=80, l=65, r=20), height=400,
@@ -1263,10 +1302,12 @@ def fig_pity_population(rdf: pd.DataFrame) -> go.Figure:
                              hovertemplate="π₃: %{y:.1f}%<extra></extra>"), secondary_y=True)
     fig.add_trace(go.Scatter(x=rdf["Month"], y=rdf["Cons Per-Prize (formula)"], mode="lines",
                              name="Cons per-prize (no pity)", line=dict(color=COLORS["quests"], dash="dot", width=2),
-                             hovertemplate="No pity: %{y:,.0f} $AVA<extra></extra>"), secondary_y=False)
+                             customdata=[f"No pity: {fmt_ava(v)} $AVA" for v in rdf["Cons Per-Prize (formula)"]],
+                             hovertemplate="%{customdata}<extra></extra>"), secondary_y=False)
     fig.add_trace(go.Scatter(x=rdf["Month"], y=rdf["Cons Per-Prize (pity)"], mode="lines",
                              name="Cons per-prize (with pity)", line=dict(color=COLORS["quests"], width=2.5),
-                             hovertemplate="With pity: %{y:,.0f} $AVA<extra></extra>"), secondary_y=False)
+                             customdata=[f"With pity: {fmt_ava(v)} $AVA" for v in rdf["Cons Per-Prize (pity)"]],
+                             hovertemplate="%{customdata}<extra></extra>"), secondary_y=False)
     fig.add_hline(y=RAFFLE_CONS_PP_FLOOR, line_dash="dash", line_color=COLORS["floor"], opacity=0.5,
                   annotation_text="80 $AVA floor", annotation_position="bottom right", secondary_y=False)
     fig.update_yaxes(title_text="Committers / per-prize $AVA", secondary_y=False)
@@ -1279,9 +1320,12 @@ def fig_pity_population(rdf: pd.DataFrame) -> go.Figure:
     return fig
 
 
-def fig_expected_winnings(rdf: pd.DataFrame, profiles_df: pd.DataFrame) -> go.Figure:
-    """Expected annual $AVA winnings per profile (last month's pool), stacked by tier."""
-    last = rdf.iloc[-1]
+def fig_expected_winnings(rdf: pd.DataFrame, profiles_df: pd.DataFrame, ref_month: int = None) -> go.Figure:
+    """Expected annual $AVA winnings per profile (chosen month's pool), stacked by tier."""
+    if ref_month is not None and (rdf["Month"] == ref_month).any():
+        last = rdf[rdf["Month"] == ref_month].iloc[0]
+    else:
+        last = rdf.iloc[-1]
     T = max(last["Total Tickets T"], 1)
     mid_w, cons_w = last["Mid Winners"], last["Cons Winners (pity)"]
     jp, mp, cp = last["Jackpot Per-Prize"], last["Mid Per-Prize"], last["Cons Per-Prize (pity)"]
@@ -1296,15 +1340,19 @@ def fig_expected_winnings(rdf: pd.DataFrame, profiles_df: pd.DataFrame) -> go.Fi
 
     fig = go.Figure()
     fig.add_trace(go.Bar(x=names, y=ev_j, name="Jackpot EV", marker_color=COLORS["raffle"],
-                         hovertemplate="Jackpot EV: %{y:,.0f} $AVA/yr<extra></extra>"))
+                         customdata=[f"Jackpot EV: {fmt_ava(v)} $AVA/yr" for v in ev_j],
+                         hovertemplate="%{customdata}<extra></extra>"))
     fig.add_trace(go.Bar(x=names, y=ev_m, name="Mid EV", marker_color=COLORS["mms"],
-                         hovertemplate="Mid EV: %{y:,.0f} $AVA/yr<extra></extra>"))
+                         customdata=[f"Mid EV: {fmt_ava(v)} $AVA/yr" for v in ev_m],
+                         hovertemplate="%{customdata}<extra></extra>"))
     fig.add_trace(go.Bar(x=names, y=ev_c, name="Consolation EV", marker_color=COLORS["quests"],
-                         hovertemplate="Cons EV: %{y:,.0f} $AVA/yr<extra></extra>"))
+                         customdata=[f"Cons EV: {fmt_ava(v)} $AVA/yr" for v in ev_c],
+                         hovertemplate="%{customdata}<extra></extra>"))
     fig.update_layout(
         barmode="stack",
-        title="Expected Annual Raffle Winnings by User Profile  (commits all monthly tickets)",
+        title=f"Expected Annual Raffle Winnings by User Profile  (Month {int(last['Month'])} pool, commits all monthly tickets)",
         xaxis_title="User profile (Component-2 tier)", yaxis_title="Expected $AVA / year",
+        yaxis=dict(tickformat="~s"),
         legend=dict(orientation="h", y=-0.25),
         margin=dict(t=55, b=90, l=65, r=20), height=400,
     )
@@ -1730,10 +1778,12 @@ def main():
 
         st.markdown(
             "**Component 6 — Raffle System.** Two coupled simulations: the **token "
-            "distribution** (a fixed **7% of MVT ≈ {pool:.3f}M \\$AVA/mo** prize pool, "
+            "distribution** (prize pool = the **Raffle %** you set in the sidebar's "
+            "*Category Budget Splits* — currently **{pct:.0f}% of MVT ≈ {pool} \\$AVA/mo**, "
             "independent of scan volume) and the **ticket economy** (engagement-driven — "
             "scanning earns \\$AVA but **zero tickets**). Edit any month's scenario in the "
-            "grid below; every chart updates live.".format(pool=metrics.raffle_budget_m)
+            "grid below; every chart updates live.".format(
+                pct=params.raffle_pct, pool=fmt_ava(metrics.raffle_budget_m * 1e6))
         )
 
         raffle_pool_tokens = metrics.raffle_budget_m * 1e6
@@ -1776,6 +1826,19 @@ def main():
         else:
             st.caption(f"Weighted avg = **{avg_tix:,.0f} tickets/committer/mo**.")
 
+        # ---- Prize-tier winner bounds (parametric floors & ceilings) ----
+        st.markdown("**Prize-tier winner bounds** — winners scale with N_active "
+                    "(Mid = 1% × N_active, Consolation = 15% × N_active), clamped to these limits.")
+        wc1, wc2, wc3, wc4 = st.columns(4)
+        mid_floor = wc1.number_input("Mid winners — floor", min_value=1, max_value=100_000,
+                                     value=RAFFLE_MID_FLOOR, step=1)
+        mid_ceil  = wc2.number_input("Mid winners — ceiling", min_value=int(mid_floor), max_value=1_000_000,
+                                     value=max(RAFFLE_MID_CEIL, int(mid_floor)), step=10)
+        cons_floor = wc3.number_input("Consolation winners — floor", min_value=1, max_value=100_000,
+                                      value=RAFFLE_CONS_FLOOR, step=10)
+        cons_ceil  = wc4.number_input("Consolation winners — ceiling", min_value=int(cons_floor), max_value=1_000_000,
+                                      value=max(RAFFLE_CONS_CEIL, int(cons_floor)), step=100)
+
         # ---- Per-month editable scenario grid ----
         st.markdown("**Per-month scenario grid** — edit any cell to craft custom monthly scenarios.")
         grid_seed = pd.DataFrame({
@@ -1793,22 +1856,35 @@ def main():
             },
         )
 
-        raffle_df = run_raffle_simulation(grid_df, profiles_df, raffle_pool_tokens)
+        raffle_df = run_raffle_simulation(
+            grid_df, profiles_df, raffle_pool_tokens,
+            mid_floor=int(mid_floor), mid_ceil=int(mid_ceil),
+            cons_floor=int(cons_floor), cons_ceil=int(cons_ceil),
+        )
 
         st.markdown("---")
 
         # ---- Charts ----
-        st.plotly_chart(fig_raffle_tokens(raffle_df), use_container_width=True)
+        st.plotly_chart(fig_raffle_tokens(raffle_df, params.raffle_pct), use_container_width=True)
         st.plotly_chart(fig_prize_tiers(raffle_df), use_container_width=True)
 
+        st.plotly_chart(fig_tickets_farmed_committed(raffle_df), use_container_width=True)
+
+        # Reference month drives the probability & expected-winnings views
+        ref_month = st.select_slider(
+            "Reference month for probability & expected-winnings charts",
+            options=raffle_df["Month"].tolist(),
+            value=int(raffle_df["Month"].iloc[-1]),
+            help="These two charts are snapshots of a single draw. Pick which month's "
+                 "pool (N_active, T, winner slots) to evaluate.",
+        )
         col_a, col_b = st.columns(2)
         with col_a:
-            st.plotly_chart(fig_tickets_farmed_committed(raffle_df), use_container_width=True)
+            st.plotly_chart(fig_win_prob_curve(raffle_df, ref_month), use_container_width=True)
         with col_b:
-            st.plotly_chart(fig_win_prob_curve(raffle_df), use_container_width=True)
+            st.plotly_chart(fig_expected_winnings(raffle_df, profiles_df, ref_month), use_container_width=True)
 
         st.plotly_chart(fig_pity_population(raffle_df), use_container_width=True)
-        st.plotly_chart(fig_expected_winnings(raffle_df, profiles_df), use_container_width=True)
 
         with st.expander("📋 Full raffle simulation data table"):
             st.dataframe(raffle_df, hide_index=True, use_container_width=True)
