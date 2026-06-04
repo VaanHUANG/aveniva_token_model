@@ -988,6 +988,16 @@ RAFFLE_DEFAULT_PROFILES = [
     {"Profile": "Legend (3.0×)",     "% of users":  5.0, "Tickets/mo": 7000},
 ]
 
+# Per-tier seed for the monthly long-format grid. Higher tiers are assumed to
+# commit at higher rates (more engaged). All values are user-editable per month.
+RAFFLE_TIER_NAMES = ["Scout (1.0×)", "Explorer (1.5×)", "Pathfinder (2.0×)", "Legend (3.0×)"]
+RAFFLE_TIER_SEED = [
+    {"Tier": "Scout (1.0×)",      "Profile (%)": 55.0, "Tickets": 2650, "Commit Rate (%)": 45.0},
+    {"Tier": "Explorer (1.5×)",   "Profile (%)": 25.0, "Tickets": 3975, "Commit Rate (%)": 60.0},
+    {"Tier": "Pathfinder (2.0×)", "Profile (%)": 15.0, "Tickets": 5300, "Commit Rate (%)": 72.0},
+    {"Tier": "Legend (3.0×)",     "Profile (%)":  5.0, "Tickets": 7000, "Commit Rate (%)": 85.0},
+]
+
 
 def fmt_ava(v: float, decimals_k: int = 1, decimals_m: int = 2) -> str:
     """
@@ -1017,10 +1027,9 @@ def pity_eligible_fraction(p_win: float) -> float:
     return q ** 3 / (1.0 + q + q ** 2 + q ** 3)
 
 
-def compute_raffle_month(
-    n_users: float,
-    commit_rate_pct: float,
-    avg_tickets_per_committer: float,
+def compute_raffle_draw(
+    n_active: float,
+    total_tickets_T: float,
     raffle_pool_tokens: float,
     mid_floor: int = RAFFLE_MID_FLOOR,
     mid_ceil: int = RAFFLE_MID_CEIL,
@@ -1028,14 +1037,16 @@ def compute_raffle_month(
     cons_ceil: int = RAFFLE_CONS_CEIL,
 ) -> dict:
     """
-    Resolve one monthly draw: tier winners, per-prize amounts, pool T, odds,
-    and pity load. Pure function of the row inputs + the monthly raffle pool.
+    Resolve one monthly draw from its aggregate inputs: the number of committers
+    (n_active) and the total committed ticket pool (T). The per-tier user mix,
+    tickets and commit rates are aggregated upstream in run_raffle_simulation.
 
     Winner floor/ceiling per tier are user-parametric (defaults from the C6 spec).
     Returns a flat dict of all quantities (one simulation row).
     """
-    n_active = max(0.0, n_users * commit_rate_pct / 100.0)          # committers
-    total_tickets_T = n_active * avg_tickets_per_committer          # T
+    n_active = max(0.0, float(n_active))                            # committers
+    total_tickets_T = max(0.0, float(total_tickets_T))             # T
+    avg_tickets_per_committer = total_tickets_T / n_active if n_active > 0 else 0.0
 
     # ---- Tier budgets (tokens) ----
     jackpot_budget = raffle_pool_tokens * RAFFLE_JACKPOT_PCT / 100.0
@@ -1092,8 +1103,6 @@ def compute_raffle_month(
     awarded = jackpot_perprize + mid_winners * mid_perprize + cons_winners_pity * cons_perprize_pity
 
     return {
-        "N Users":              int(n_users),
-        "Commit Rate %":        round(commit_rate_pct, 1),
         "N Active":             int(n_active),
         "Avg Tickets/Committer": int(avg_tickets_per_committer),
         "Total Tickets T":      int(total_tickets_T),
@@ -1127,7 +1136,6 @@ def weighted_tickets_per_committer(profiles_df: pd.DataFrame) -> float:
 
 def run_raffle_simulation(
     grid_df: pd.DataFrame,
-    profiles_df: pd.DataFrame,
     raffle_pool_tokens: float,
     mid_floor: int = RAFFLE_MID_FLOOR,
     mid_ceil: int = RAFFLE_MID_CEIL,
@@ -1135,25 +1143,44 @@ def run_raffle_simulation(
     cons_ceil: int = RAFFLE_CONS_CEIL,
 ) -> pd.DataFrame:
     """
-    Build the month-by-month raffle simulation from the editable grid.
-    grid_df columns: Month, N Users, Commit Rate %, New Scans, Dup Scans.
+    Build the month-by-month raffle simulation from the long-format grid.
+
+    grid_df is one row per (Month × Tier) with columns:
+        Month, N Users, Tier, Profile (%), Tickets, Commit Rate (%).
+
+    For each month, per-tier inputs are aggregated:
+        tier_users      = N_users × Profile% / 100        (Profile% normalised to sum 100)
+        tier_committers = tier_users × CommitRate% / 100
+        N_active        = Σ tier_committers
+        T               = Σ tier_committers × tier_tickets
     """
-    avg_tix = weighted_tickets_per_committer(profiles_df)
     rows = []
-    for _, g in grid_df.iterrows():
-        rec = compute_raffle_month(
-            n_users           = float(g["N Users"]),
-            commit_rate_pct   = float(g["Commit Rate %"]),
-            avg_tickets_per_committer = avg_tix,
-            raffle_pool_tokens = raffle_pool_tokens,
+    for month, g in grid_df.groupby("Month", sort=True):
+        n_users = float(g["N Users"].iloc[0])                       # monthly total (first row)
+
+        pct = g["Profile (%)"].clip(lower=0).astype(float)
+        pct_sum = pct.sum()
+        shares = (pct / pct_sum) if pct_sum > 0 else pct * 0.0      # normalise to 100%
+
+        n_active = 0.0
+        total_T = 0.0
+        for (_, r), share in zip(g.iterrows(), shares):
+            tier_users      = n_users * float(share)
+            tier_committers = tier_users * float(r["Commit Rate (%)"]) / 100.0
+            n_active += tier_committers
+            total_T  += tier_committers * float(r["Tickets"])
+
+        rec = compute_raffle_draw(
+            n_active=n_active, total_tickets_T=total_T,
+            raffle_pool_tokens=raffle_pool_tokens,
             mid_floor=mid_floor, mid_ceil=mid_ceil,
             cons_floor=cons_floor, cons_ceil=cons_ceil,
         )
-        rec["Month"]     = int(g["Month"])
-        rec["New Scans"] = int(g.get("New Scans", 0))
-        rec["Dup Scans"] = int(g.get("Dup Scans", 0))
+        rec["Month"]   = int(month)
+        rec["N Users"] = int(n_users)
         rows.append(rec)
-    return pd.DataFrame(rows)
+
+    return pd.DataFrame(rows).sort_values("Month").reset_index(drop=True)
 
 
 # ---- Raffle chart functions -------------------------------------------------
@@ -1788,43 +1815,17 @@ def main():
 
         raffle_pool_tokens = metrics.raffle_budget_m * 1e6
 
-        # ---- Scenario controls ----
-        c1, c2, c3 = st.columns([1, 1, 2])
+        # ---- Scenario seed controls ----
+        c1, c2 = st.columns(2)
         n_months_raffle = c1.number_input(
             "Months to simulate", min_value=1, max_value=120, value=12, step=1,
-            help="Number of monthly draws in the editable grid below.",
+            help="Number of monthly draws. Changing this rebuilds the grid below.",
         )
         default_users = c2.number_input(
-            "Starting active users", min_value=100, max_value=5_000_000,
+            "Starting active users (per month)", min_value=100, max_value=5_000_000,
             value=10_000, step=1_000,
-            help="Seeds month 1 of the grid. Edit individual months below.",
+            help="Seeds the monthly total-users value for every month. Override any month in the grid.",
         )
-        default_commit = c3.slider(
-            "Default commit rate (% of users who commit ≥1 ticket)",
-            min_value=1.0, max_value=100.0, value=60.0, step=1.0,
-            help="N_active = users × commit rate. Per the pure-manual commit model, "
-                 "only committers enter a draw. Seeds the grid; edit per month.",
-        )
-
-        # ---- User-profile tier mix (drives tickets per committer) ----
-        st.markdown("**User-profile tier mix** — drives tickets earned per committer "
-                    "(Component-2 tiers; scanning earns no tickets).")
-        profiles_default = pd.DataFrame(RAFFLE_DEFAULT_PROFILES)
-        profiles_df = st.data_editor(
-            profiles_default, hide_index=True, use_container_width=True,
-            num_rows="dynamic", key="raffle_profiles",
-            column_config={
-                "% of users": st.column_config.NumberColumn(format="%.1f %%", min_value=0.0),
-                "Tickets/mo": st.column_config.NumberColumn(format="%d", min_value=0),
-            },
-        )
-        mix_sum = profiles_df["% of users"].sum()
-        avg_tix = weighted_tickets_per_committer(profiles_df)
-        if abs(mix_sum - 100.0) > 0.1:
-            st.caption(f"ℹ️ Tier mix sums to {mix_sum:.1f}% — weights are normalised. "
-                       f"Weighted avg = **{avg_tix:,.0f} tickets/committer/mo**.")
-        else:
-            st.caption(f"Weighted avg = **{avg_tix:,.0f} tickets/committer/mo**.")
 
         # ---- Prize-tier winner bounds (parametric floors & ceilings) ----
         st.markdown("**Prize-tier winner bounds** — winners scale with N_active "
@@ -1839,25 +1840,62 @@ def main():
         cons_ceil  = wc4.number_input("Consolation winners — ceiling", min_value=int(cons_floor), max_value=1_000_000,
                                       value=max(RAFFLE_CONS_CEIL, int(cons_floor)), step=100)
 
-        # ---- Per-month editable scenario grid ----
-        st.markdown("**Per-month scenario grid** — edit any cell to craft custom monthly scenarios.")
-        grid_seed = pd.DataFrame({
-            "Month":        list(range(1, int(n_months_raffle) + 1)),
-            "N Users":      [int(default_users)] * int(n_months_raffle),
-            "Commit Rate %": [round(default_commit, 1)] * int(n_months_raffle),
-            "New Scans":    [int(params.new_scans_monthly)] * int(n_months_raffle),
-            "Dup Scans":    [int(params.dup_scans_monthly)] * int(n_months_raffle),
-        })
+        # ---- Per-month scenario grid (long format: 4 tier rows per month) ----
+        st.markdown("**Per-month scenario grid — single source of truth.**")
+        st.info(
+            "This grid **overrides** the seed inputs above. Each month has **four tier rows** "
+            "(Scout → Legend). Edit them to model month-specific scenarios:\n\n"
+            "- **N Users** — total active users that month (a per-month value; edit it on the "
+            "first tier row of the month, it applies to all four).\n"
+            "- **Profile (%)** — that month's share of users in each tier. The four values "
+            "**should sum to 100%** per month (auto-normalised if not).\n"
+            "- **Tickets** — monthly tickets earned by a user in that tier (engagement-driven; "
+            "scanning earns none).\n"
+            "- **Commit Rate (%)** — share of that tier's users who commit ≥1 ticket to the draw.\n\n"
+            "Per month: `N_active = Σ tier_users × commit_rate`, and the committed ticket pool "
+            "`T = Σ tier_committers × tier_tickets`.",
+            icon="🧭",
+        )
+
+        # Build long-format seed: months × 4 tiers
+        seed_rows = []
+        for mth in range(1, int(n_months_raffle) + 1):
+            for tier in RAFFLE_TIER_SEED:
+                seed_rows.append({
+                    "Month":           mth,
+                    "N Users":         int(default_users),
+                    "Tier":            tier["Tier"],
+                    "Profile (%)":     tier["Profile (%)"],
+                    "Tickets":         tier["Tickets"],
+                    "Commit Rate (%)": tier["Commit Rate (%)"],
+                })
+        grid_seed = pd.DataFrame(seed_rows)
+
         grid_df = st.data_editor(
             grid_seed, hide_index=True, use_container_width=True, key="raffle_grid",
+            height=min(560, 38 * len(grid_seed) + 40),
             column_config={
                 "Month": st.column_config.NumberColumn(disabled=True),
-                "Commit Rate %": st.column_config.NumberColumn(format="%.1f %%", min_value=0.0, max_value=100.0),
+                "Tier":  st.column_config.TextColumn(disabled=True),
+                "N Users": st.column_config.NumberColumn(format="%d", min_value=0),
+                "Profile (%)": st.column_config.NumberColumn(format="%.1f %%", min_value=0.0, max_value=100.0),
+                "Tickets": st.column_config.NumberColumn(format="%d", min_value=0),
+                "Commit Rate (%)": st.column_config.NumberColumn(format="%.1f %%", min_value=0.0, max_value=100.0),
             },
         )
 
+        # Per-month Profile% sum sanity check
+        bad_months = []
+        for mth, g in grid_df.groupby("Month"):
+            if abs(g["Profile (%)"].sum() - 100.0) > 0.1:
+                bad_months.append(int(mth))
+        if bad_months:
+            st.caption(f"ℹ️ Profile (%) doesn't sum to 100% in month(s) "
+                       f"{', '.join(map(str, bad_months[:8]))}{'…' if len(bad_months) > 8 else ''} "
+                       f"— shares are auto-normalised for those months.")
+
         raffle_df = run_raffle_simulation(
-            grid_df, profiles_df, raffle_pool_tokens,
+            grid_df, raffle_pool_tokens,
             mid_floor=int(mid_floor), mid_ceil=int(mid_ceil),
             cons_floor=int(cons_floor), cons_ceil=int(cons_ceil),
         )
@@ -1878,11 +1916,18 @@ def main():
             help="These two charts are snapshots of a single draw. Pick which month's "
                  "pool (N_active, T, winner slots) to evaluate.",
         )
+        # Per-profile tickets for the reference month (from that month's tier rows)
+        ref_rows = grid_df[grid_df["Month"] == ref_month]
+        ref_profiles = pd.DataFrame({
+            "Profile":    ref_rows["Tier"].tolist(),
+            "Tickets/mo": ref_rows["Tickets"].tolist(),
+        })
+
         col_a, col_b = st.columns(2)
         with col_a:
             st.plotly_chart(fig_win_prob_curve(raffle_df, ref_month), use_container_width=True)
         with col_b:
-            st.plotly_chart(fig_expected_winnings(raffle_df, profiles_df, ref_month), use_container_width=True)
+            st.plotly_chart(fig_expected_winnings(raffle_df, ref_profiles, ref_month), use_container_width=True)
 
         st.plotly_chart(fig_pity_population(raffle_df), use_container_width=True)
 
