@@ -124,6 +124,8 @@ class TokenomicsParams:
     testnet_alpha: float        # Multiplier α applied to all mainnet base rates
     testnet_pool_m: float       # Testnet token pool in millions
     testnet_months: int         # Number of months the testnet phase runs
+    # testnet_tge_pct is declared at the end of this dataclass (default 25.0)
+    # because dataclass fields with defaults must follow those without.
 
     # ---- Hard cap ---------------------------------------------------------
     hard_cap_new_scan: int      # Maximum $AVA per new scan; excess scan budget flows to RC
@@ -135,6 +137,10 @@ class TokenomicsParams:
 
     # ---- RC combined timeline chart ---------------------------------------
     testnet_chart_users: int    # Active testnet users assumed for the RC timeline chart
+
+    # ---- Testnet TGE unlock (allocation sheet: 25% at TGE, rest vests) ----
+    testnet_tge_pct: float = 25.0   # % of testnet pool unlocked at TGE; remainder
+                                    # vests linearly over testnet_months
 
 
 @dataclass
@@ -171,7 +177,9 @@ class DerivedMetrics:
     # Testnet rates
     tn_new_scan_tokens: float
     tn_dup_tokens: float
-    tn_monthly_budget_m: float      # Testnet pool / testnet months
+    tn_monthly_budget_m: float      # AVERAGE monthly budget (pool / months)
+    tn_tge_m: float                 # Testnet TGE unlock (millions, immediate)
+    tn_vest_monthly_m: float        # Post-TGE testnet vesting per month (millions)
 
 
 # ==============================================================================
@@ -236,6 +244,11 @@ def derive_metrics(p: TokenomicsParams) -> DerivedMetrics:
     tn_dup = base_dup * p.testnet_alpha
     tn_monthly_budget_m = p.testnet_pool_m / max(p.testnet_months, 1)
 
+    # Testnet unlock structure (allocation sheet): testnet_tge_pct% unlocked at
+    # TGE, remainder vesting linearly over the testnet window.
+    tn_tge_m          = p.testnet_pool_m * (p.testnet_tge_pct / 100.0)
+    tn_vest_monthly_m = (p.testnet_pool_m - tn_tge_m) / max(p.testnet_months, 1)
+
     return DerivedMetrics(
         community_pool_m          = community_pool_m,
         rc_m                      = rc_m,
@@ -255,6 +268,8 @@ def derive_metrics(p: TokenomicsParams) -> DerivedMetrics:
         tn_new_scan_tokens        = tn_new,
         tn_dup_tokens             = tn_dup,
         tn_monthly_budget_m       = tn_monthly_budget_m,
+        tn_tge_m                  = tn_tge_m,
+        tn_vest_monthly_m         = tn_vest_monthly_m,
     )
 
 
@@ -688,7 +703,8 @@ def fig_rc_combined_timeline(
     Left segment  — Testnet phase:
       Simulates the testnet pool depletion month-by-month using
       p.testnet_chart_users × (5 new scans + 20 dup scans per user per month)
-      at testnet rates (α-scaled).  Pool starts at p.testnet_pool_m.
+      at testnet rates (α-scaled).  Available capital starts at the TGE unlock
+      (testnet_tge_pct% of the pool) and grows by the monthly vesting tranche.
 
     Transition    — "0 (ICO)":
       Vertical dashed line marks the TGE / public launch point.
@@ -709,10 +725,12 @@ def fig_rc_combined_timeline(
         + p.testnet_chart_users * scans_per_user_dup * d.tn_dup_tokens
     ) / 1_000_000.0
 
-    tn_balances = [p.testnet_pool_m]          # T M0 = full pool
-    bal = p.testnet_pool_m
+    # Unlock structure per allocation sheet: tn_tge_m available at T M0,
+    # remainder vesting in monthly tranches — NOT the full pool up front.
+    tn_balances = [d.tn_tge_m]                # T M0 = TGE unlock only
+    bal = d.tn_tge_m
     for _ in range(p.testnet_months):
-        bal = max(0.0, bal - monthly_tn_spend)
+        bal = max(0.0, bal + d.tn_vest_monthly_m - monthly_tn_spend)
         tn_balances.append(bal)               # T M1 … T MN, then ICO point
 
     # --- Build unified x-axis labels ---
@@ -829,10 +847,13 @@ def fig_testnet_burn(p: TokenomicsParams, d: DerivedMetrics) -> go.Figure:
             + testers * scans_per_tester_dup * d.tn_dup_tokens
         ) / 1e6   # convert to millions
 
-        balance = p.testnet_pool_m
+        # Available capital = TGE unlock + vesting tranches (within the window),
+        # minus spend. Vesting stops after the testnet window ends.
+        balance = d.tn_tge_m
         balances = []
-        for _ in range(p.testnet_months + 3):   # a few months beyond window
-            balance = max(0, balance - monthly_spend)
+        for m in range(1, p.testnet_months + 4):   # a few months beyond window
+            inflow = d.tn_vest_monthly_m if m <= p.testnet_months else 0.0
+            balance = max(0.0, balance + inflow - monthly_spend)
             balances.append(round(balance, 2))
 
         months = list(range(1, len(balances) + 1))
@@ -1513,6 +1534,11 @@ def render_sidebar() -> TokenomicsParams:
         "Testnet pool (millions)", min_value=10.0, max_value=500.0,
         value=128.0, step=10.0,
     )
+    testnet_tge_pct = st.sidebar.slider(
+        "Testnet TGE unlock (%)", min_value=0, max_value=100, value=25,
+        help="Per the allocation sheet: % of the testnet pool unlocked immediately "
+             "at TGE. The remainder vests linearly over the testnet window.",
+    )
     testnet_months = st.sidebar.slider(
         "Testnet duration (months)", min_value=1, max_value=18, value=6,
     )
@@ -1562,6 +1588,7 @@ def render_sidebar() -> TokenomicsParams:
         testnet_alpha       = testnet_alpha,
         testnet_pool_m      = testnet_pool_m,
         testnet_months      = testnet_months,
+        testnet_tge_pct     = float(testnet_tge_pct),
         testnet_chart_users = testnet_chart_users,
         spike_multiplier    = spike_multiplier,
         spike_months        = spike_months,
@@ -1716,9 +1743,14 @@ def main():
             rate_df = build_rate_table(params, metrics)
             st.dataframe(rate_df, hide_index=True, use_container_width=True, height=330)
 
-            # Scan budget utilisation health check
-            new_cost_m  = params.new_scans_monthly * metrics.base_new_scan_tokens / 1e6
-            dup_cost_m  = params.dup_scans_monthly  * metrics.base_dup_tokens      / 1e6
+            # Scan budget utilisation health check.
+            # NOTE: uses EFFECTIVE (hard-capped) rates — what contributors are
+            # actually paid — not the pool-derived base rate. The base rate is
+            # back-calculated from the scan budget, so base-rate cost ≡ budget
+            # (always exactly 100%), which made this check meaningless and let
+            # floating-point noise flip it to a false "OVER budget" warning.
+            new_cost_m  = params.new_scans_monthly * metrics.effective_new_scan_tokens / 1e6
+            dup_cost_m  = params.dup_scans_monthly  * metrics.effective_dup_tokens      / 1e6
             total_scan_m = new_cost_m + dup_cost_m
             utilisation  = total_scan_m / max(metrics.scan_budget_m, 0.001) * 100
 
@@ -1727,7 +1759,8 @@ def main():
             u1.metric(
                 "New scan cost",
                 f"{new_cost_m:.2f}M $AVA",
-                help="Monthly $AVA spent on new-scan rewards at steady-state volume.",
+                help="Monthly $AVA spent on new-scan rewards at steady-state volume, "
+                     "at the effective (hard-capped) rate contributors actually earn.",
             )
             u2.metric(
                 "Duplicate cost",
@@ -1941,9 +1974,12 @@ def main():
 
         st.markdown(
             f"Testnet rates = mainnet base rates × **α = {params.testnet_alpha}**. "
-            f"Budget: **{params.testnet_pool_m:.0f}M \\$AVA** over "
-            f"**{params.testnet_months} months** "
-            f"= **{metrics.tn_monthly_budget_m:.1f}M \\$AVA / month**."
+            f"Pool: **{params.testnet_pool_m:.0f}M \\$AVA** — "
+            f"**{metrics.tn_tge_m:.0f}M ({params.testnet_tge_pct:.0f}%) unlocked at TGE**, "
+            f"remaining {params.testnet_pool_m - metrics.tn_tge_m:.0f}M vesting "
+            f"**{metrics.tn_vest_monthly_m:.1f}M / month** over "
+            f"{params.testnet_months} months "
+            f"(average {metrics.tn_monthly_budget_m:.1f}M / month)."
         )
 
         # ---- Testnet key metrics ----
@@ -1969,13 +2005,14 @@ def main():
             ),
         )
         t3.metric(
-            "Testnet monthly budget",
-            f"{metrics.tn_monthly_budget_m:.1f}M $AVA",
+            "TGE unlock + monthly vesting",
+            f"{metrics.tn_tge_m:.0f}M + {metrics.tn_vest_monthly_m:.1f}M/mo",
             help=(
-                f"Testnet pool ({params.testnet_pool_m:.0f}M $AVA) ÷ "
-                f"testnet months ({params.testnet_months}). "
-                "This is the average monthly budget available; in practice spend depends "
-                "on how many testers are active and how many scans they submit."
+                f"{params.testnet_tge_pct:.0f}% of the testnet pool "
+                f"({metrics.tn_tge_m:.0f}M $AVA) unlocks at TGE; the remaining "
+                f"{params.testnet_pool_m - metrics.tn_tge_m:.0f}M vests linearly over "
+                f"{params.testnet_months} months. Front-loaded availability per the "
+                "allocation sheet — not a flat pool ÷ months average."
             ),
         )
         max_new_scans_per_month = int(
@@ -2009,13 +2046,24 @@ def main():
                 v * 5  * metrics.tn_new_scan_tokens
                 + v * 20 * metrics.tn_dup_tokens
             ) / 1e6
-            runway = params.testnet_pool_m / max(monthly_m, 0.001)
+            # Vesting-aware runway: TGE unlock up front, monthly tranches during
+            # the window. Runway = first month available capital is exhausted.
+            bal = metrics.tn_tge_m
+            runway = None
+            for m in range(1, params.testnet_months * 4 + 1):
+                inflow = metrics.tn_vest_monthly_m if m <= params.testnet_months else 0.0
+                bal = bal + inflow - monthly_m
+                if bal < 0:
+                    runway = m
+                    break
+            survives = runway is None or runway > params.testnet_months
             tbl_rows.append({
                 "Active testers":              f"{v:,}",
                 "Monthly spend (M $AVA)":      f"{monthly_m:.3f}",
-                "Pool runway (months)":        f"{runway:.1f}",
+                "Pool runway (months)":
+                    f"> {params.testnet_months * 4}" if runway is None else f"{runway}",
                 "Survives testnet window?":
-                    "✅" if runway >= params.testnet_months else "⚠️ Depletes early",
+                    "✅" if survives else "⚠️ Depletes early",
             })
         st.dataframe(pd.DataFrame(tbl_rows), hide_index=True, use_container_width=True)
 
