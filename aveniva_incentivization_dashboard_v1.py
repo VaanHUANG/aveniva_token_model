@@ -142,6 +142,30 @@ class TokenomicsParams:
     testnet_tge_pct: float = 25.0   # % of testnet pool unlocked at TGE; remainder
                                     # vests linearly over testnet_months
 
+    # ---- Duplicate-scan model (supervisor feedback, C1 point 4) -----------
+    # "static":   duplicate volume = the fixed sidebar input × vol multiplier
+    #             (legacy behaviour; new and dup scale together).
+    # "coverage": the new/dup split derives from catalogue coverage (the
+    #             supervisor's dup_prob = C_t/N idea, integrated within each
+    #             month so that a month's scans also overlap each other —
+    #             the coupon-collector form):
+    #                 new_t = (N − C_t) · (1 − exp(−S_t / (w·N)))
+    #                 dup_t = S_t − new_t;   C_{t+1} = C_t + new_t
+    #             where S_t = total scan demand, C_t = cumulative catalogue,
+    #             N = item universe, w = popularity weight (w > 1 concentrates
+    #             scans on popular items Zipf-style, shrinking effective
+    #             discovery breadth; w = 1 is the pure uniform model).
+    #             New scans start high (sparse catalogue) and taper as C_t → N,
+    #             duplicates start low and rise — fixing the launch-curve shape
+    #             flagged in supervisor feedback point 6. The sidebar new/dup
+    #             volume inputs define TOTAL scan demand in this mode.
+    dup_model: str = "static"           # "static" | "coverage"
+    item_universe_n: int = 500_000      # N — addressable item space (retail SKU proxy)
+    initial_catalog_items: int = 30_000 # C_0 — pre-seeded catalogue at launch
+                                        # (default ≈ testnet: 1,000 testers × 5 new
+                                        # scans/mo × 6 months)
+    popularity_weight: float = 1.0      # w — scan concentration factor (1 = uniform)
+
 
 @dataclass
 class DerivedMetrics:
@@ -284,6 +308,16 @@ def run_simulation(p: TokenomicsParams, d: DerivedMetrics, n_months: int = 36) -
       2. Decay phase   (months spike+1 … spike+decay):    linear decay → base × 1.0
       3. Steady state  (months spike+decay+1 … n_months): volume = base × 1.0
 
+    New-vs-duplicate split (p.dup_model)
+    ------------------------------------
+    "static":   new and dup volumes are the sidebar inputs, both × vol multiplier.
+    "coverage": the sidebar inputs define TOTAL scan demand; each month
+                  new_scans = (N − C_t) · (1 − exp(−S_t / (w·N)))
+                  dup_scans = S_t − new_scans;   C_{t+1} = C_t + new_scans
+                (coupon-collector integral of dup_prob = C_t/N, so a month's
+                scans overlap each other as well as the existing catalogue).
+                Discovery saturates smoothly as the catalogue fills.
+
     Budget model (per month)
     ------------------------
     For each month:
@@ -324,6 +358,12 @@ def run_simulation(p: TokenomicsParams, d: DerivedMetrics, n_months: int = 36) -
     hc_new_rate = min(d.base_new_scan_tokens, float(p.hard_cap_new_scan))
     hc_dup_rate = hc_new_rate / max(p.dup_divisor, 1.0)
 
+    # Coverage-model state: cumulative catalogue size (tracked in both modes
+    # so the Coverage % column is always meaningful).
+    universe_n       = max(p.item_universe_n, 1)
+    catalog          = float(min(p.initial_catalog_items, universe_n))
+    total_base_scans = p.new_scans_monthly + p.dup_scans_monthly
+
     for month in range(1, n_months + 1):
 
         # ---- 1. Volume multiplier for this month ----
@@ -335,8 +375,22 @@ def run_simulation(p: TokenomicsParams, d: DerivedMetrics, n_months: int = 36) -
         else:
             vol_mult = 1.0
 
-        new_scans = p.new_scans_monthly * vol_mult
-        dup_scans = p.dup_scans_monthly * vol_mult
+        # ---- 1b. New-vs-duplicate split ----
+        if p.dup_model == "coverage":
+            total_scans = total_base_scans * vol_mult
+            remaining   = max(universe_n - catalog, 0.0)
+            # Coupon-collector form: within a month, scans overlap both the
+            # existing catalogue and each other. w > 1 concentrates scans on
+            # popular items, shrinking effective discovery breadth to S/w.
+            new_scans = remaining * (1.0 - np.exp(
+                -total_scans / (max(p.popularity_weight, 1.0) * universe_n)
+            ))
+            dup_scans = total_scans - new_scans
+        else:
+            new_scans = p.new_scans_monthly * vol_mult
+            dup_scans = p.dup_scans_monthly * vol_mult
+
+        catalog = min(catalog + new_scans, float(universe_n))
 
         # ---- 2. Hard cap savings (tokens not paid out → flow to RC) ----
         # This is the difference between what the pool rate would pay and what the hard cap allows.
@@ -387,6 +441,8 @@ def run_simulation(p: TokenomicsParams, d: DerivedMetrics, n_months: int = 36) -
             "Vol Multiplier":          round(vol_mult, 2),
             "New Scans":               int(new_scans),
             "Dup Scans":               int(dup_scans),
+            "Catalog Size":            int(catalog),
+            "Coverage %":              round(100.0 * catalog / universe_n, 2),
             # Token flows (millions)
             "Scan Accruals (M)":       round(raw_scan_accruals / 1e6, 3),
             "Total Accruals (M)":      round(total_accruals    / 1e6, 3),
@@ -634,6 +690,47 @@ def fig_volume_profile(sim_df: pd.DataFrame) -> go.Figure:
         yaxis_title="Number of scans",
         legend=dict(orientation="h", y=-0.25),
         margin=dict(t=55, b=80, l=65, r=20),
+        height=340,
+    )
+    return fig
+
+
+def fig_coverage_curve(sim_df: pd.DataFrame, p: TokenomicsParams) -> go.Figure:
+    """
+    Dual-axis chart for the coverage-based duplicate model:
+      Left axis  — catalogue coverage % (C_t / N) over time.
+      Right axis — duplicate share of total scans per month.
+    Shows discovery saturating: coverage climbs, duplicate share rises with it.
+    """
+    total = (sim_df["New Scans"] + sim_df["Dup Scans"]).clip(lower=1)
+    dup_share = 100.0 * sim_df["Dup Scans"] / total
+
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+    fig.add_trace(go.Scatter(
+        x=sim_df["Month"], y=sim_df["Coverage %"],
+        mode="lines+markers", name="Catalogue coverage (Cₜ/N)",
+        line=dict(color=COLORS["mvt"], width=2.5), marker=dict(size=5),
+        hovertemplate="Month %{x}<br>Coverage: %{y:.1f}%<extra></extra>",
+    ), secondary_y=False)
+
+    fig.add_trace(go.Scatter(
+        x=sim_df["Month"], y=dup_share,
+        mode="lines", name="Duplicate share of scans",
+        line=dict(color=COLORS["contributor"], width=2, dash="dash"),
+        hovertemplate="Month %{x}<br>Dup share: %{y:.1f}%<extra></extra>",
+    ), secondary_y=True)
+
+    fig.update_yaxes(title_text="Coverage % of item universe", secondary_y=False,
+                     rangemode="tozero")
+    fig.update_yaxes(title_text="Duplicate share of scans (%)", secondary_y=True,
+                     rangemode="tozero")
+    fig.update_layout(
+        title=(f"Catalogue Coverage & Duplicate Share  "
+               f"(N = {p.item_universe_n:,}, w = {p.popularity_weight:g})"),
+        xaxis_title="Month",
+        legend=dict(orientation="h", y=-0.25),
+        margin=dict(t=55, b=80, l=65, r=75),
         height=340,
     )
     return fig
@@ -1497,6 +1594,45 @@ def render_sidebar() -> TokenomicsParams:
         help="Duplicate scan earns 1/D of a new scan reward.",
     )
 
+    st.sidebar.subheader("Duplicate-scan model")
+    dup_model = st.sidebar.radio(
+        "New-vs-duplicate split",
+        options=["coverage", "static"],
+        index=0,
+        format_func=lambda v: (
+            "Coverage-based (Cₜ/N coupon-collector)" if v == "coverage"
+            else "Static ratio (legacy)"
+        ),
+        help="Coverage-based: the two volume inputs above define TOTAL scan "
+             "demand; the new/dup split emerges from catalogue coverage — new "
+             "scans start high and taper as the catalogue fills, duplicates "
+             "rise toward saturation. Static: both inputs are used as-is and "
+             "scale together with the launch curve (legacy behaviour).",
+    )
+    item_universe_n = st.sidebar.number_input(
+        "Item universe N", min_value=10_000, max_value=50_000_000,
+        value=500_000, step=50_000,
+        help="Estimated total addressable item space (e.g. retail SKU count "
+             "for the target market). Rough proxy is fine — coverage dynamics "
+             "matter more than the exact figure.",
+        disabled=(dup_model != "coverage"),
+    )
+    initial_catalog_items = st.sidebar.number_input(
+        "Initial catalogue size C₀", min_value=0, max_value=10_000_000,
+        value=30_000, step=5_000,
+        help="Items already catalogued at mainnet launch. Default ≈ testnet "
+             "seeding: 1,000 testers × 5 new scans/month × 6 months.",
+        disabled=(dup_model != "coverage"),
+    )
+    popularity_weight = st.sidebar.slider(
+        "Popularity weight w", min_value=1.0, max_value=20.0, value=1.0, step=0.5,
+        help="Scan concentration on popular items (Zipf proxy). Discovery per "
+             "month = (N−Cₜ)·(1−exp(−S/(w·N))): higher w shrinks effective "
+             "discovery breadth, raising the duplicate rate at every coverage "
+             "level. w = 1 is the pure uniform Cₜ/N model.",
+        disabled=(dup_model != "coverage"),
+    )
+
     # ---- Price & Floor ------------------------------------------
     st.sidebar.header("💶 Price & Floor")
 
@@ -1582,6 +1718,10 @@ def render_sidebar() -> TokenomicsParams:
         new_scans_monthly   = new_scans_monthly,
         dup_scans_monthly   = dup_scans_monthly,
         dup_divisor         = dup_divisor,
+        dup_model           = dup_model,
+        item_universe_n     = int(item_universe_n),
+        initial_catalog_items = int(initial_catalog_items),
+        popularity_weight   = float(popularity_weight),
         token_price_eur     = token_price_eur,
         floor_new_scan      = floor_new_scan,
         hard_cap_new_scan   = hard_cap_new_scan,
@@ -1799,6 +1939,10 @@ def main():
 
         # Volume profile
         st.plotly_chart(fig_volume_profile(sim_df), use_container_width=True)
+
+        # Coverage curve (only meaningful for the coverage-based dup model)
+        if params.dup_model == "coverage":
+            st.plotly_chart(fig_coverage_curve(sim_df, params), use_container_width=True)
 
         # Scan reward curve
         st.plotly_chart(
