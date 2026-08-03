@@ -88,6 +88,25 @@ BUCKET_COLORS = [
 # 2. DATA CLASSES
 # ==============================================================================
 
+# ---- Component 2 tier structure (mirrors aveniva_progression_dashboard.py) ----
+# C2 defines 6 named tiers over overall levels 1–30, each with a scan-reward
+# multiplier. C1 previously assumed a flat rate, ignoring these entirely
+# (supervisor feedback, C2 point 2). These are LOCKED to the C2 spec — the
+# user-tunable parts (tier mix, scan intensity, ramp) live in TokenomicsParams.
+C2_TIER_NAMES = ["Scout", "Taster", "Collector", "Analyst", "Expert", "Legend"]
+C2_SCAN_MULT  = [1.00,    1.15,     1.30,        1.50,      1.75,     2.00]
+
+# Default steady-state population mix (% of users per tier) — a pyramid, since
+# higher tiers require substantial cumulative XP. ASSUMPTION: revisit against
+# real cohort data once available.
+C2_DEFAULT_MIX = [40.0, 25.0, 18.0, 10.0, 5.0, 2.0]
+
+# Relative scans per user per tier. Cost is VOLUME-weighted, not headcount-
+# weighted: high-tier users both earn more per scan AND scan more, so a 2%
+# Legend population carries far more than 2% of scan volume. ASSUMPTION.
+C2_DEFAULT_INTENSITY = [1.0, 1.5, 2.2, 3.2, 4.5, 6.0]
+
+
 @dataclass
 class TokenomicsParams:
     """
@@ -159,6 +178,18 @@ class TokenomicsParams:
     #             duplicates start low and rise — fixing the launch-curve shape
     #             flagged in supervisor feedback point 6. The sidebar new/dup
     #             volume inputs define TOTAL scan demand in this mode.
+    # ---- Component 2 scan multipliers (supervisor feedback, C2 point 2) ----
+    # C1 previously priced every scan flat, ignoring C2's 1.00×–2.00× tier
+    # multipliers. When enabled, the per-scan payout is blended across the tier
+    # population and the hard cap binds LAST — i.e. on the final paid amount,
+    # post-multiplier — so no tier can ever be paid above hard_cap_new_scan.
+    enable_tier_multipliers: bool = True
+    tier_mix_pct: tuple = tuple(C2_DEFAULT_MIX)            # % of users per tier
+    tier_scan_intensity: tuple = tuple(C2_DEFAULT_INTENSITY)  # relative scans/user
+    tier_ramp_months: int = 12   # months for the population to migrate from
+                                 # all-Scout at launch to tier_mix_pct.
+                                 # 0 = start at the steady mix immediately.
+
     dup_model: str = "static"           # "static" | "coverage"
     item_universe_n: int = 500_000      # N — addressable item space (retail SKU proxy)
     initial_catalog_items: int = 30_000 # C_0 — pre-seeded catalogue at launch
@@ -198,6 +229,14 @@ class DerivedMetrics:
     effective_dup_tokens: float
     effective_new_scan_eur: float
 
+    # C2 tier-multiplier blend (supervisor feedback, C2 point 2).
+    # blended_* are volume-weighted across the C2 tier population with the hard
+    # cap binding LAST. When multipliers are disabled these equal effective_*.
+    blended_scan_mult: float          # volume-weighted avg multiplier (reporting)
+    blended_new_scan_tokens: float    # what the average scan actually costs
+    blended_dup_tokens: float
+    blended_new_scan_eur: float
+
     # Testnet rates
     tn_new_scan_tokens: float
     tn_dup_tokens: float
@@ -209,6 +248,83 @@ class DerivedMetrics:
 # ==============================================================================
 # 3. CALCULATION ENGINE
 # ==============================================================================
+
+def tier_volume_shares(p: TokenomicsParams, month: int | None = None) -> list:
+    """
+    Share of monthly SCAN VOLUME attributable to each C2 tier.
+
+    Two-step derivation:
+      1. Population shares at this month. If tier_ramp_months > 0 the
+         population starts all-Scout at launch and migrates linearly toward
+         tier_mix_pct — tiers only ratchet upward (XP never decays), so the
+         blended multiplier drifts up over time. month=None → steady mix.
+      2. Volume weighting: share_i × intensity_i, renormalised. Cost follows
+         scans, not headcount, and high tiers scan more.
+
+    Returns a list of 6 volume shares summing to 1.0.
+    """
+    mix = list(p.tier_mix_pct)
+    if len(mix) != len(C2_SCAN_MULT):
+        mix = list(C2_DEFAULT_MIX)
+
+    # --- 1. Population shares (with optional ramp) ---
+    if month is not None and p.tier_ramp_months > 0:
+        progress = min(1.0, month / float(p.tier_ramp_months))
+        launch = [100.0] + [0.0] * (len(mix) - 1)     # everyone starts Scout
+        pop = [(1.0 - progress) * launch[i] + progress * mix[i]
+               for i in range(len(mix))]
+    else:
+        pop = mix
+
+    # --- 2. Volume weighting ---
+    intensity = list(p.tier_scan_intensity)
+    if len(intensity) != len(mix):
+        intensity = list(C2_DEFAULT_INTENSITY)
+
+    weighted = [max(pop[i], 0.0) * max(intensity[i], 0.0) for i in range(len(mix))]
+    total = sum(weighted)
+    if total <= 0:
+        return [1.0] + [0.0] * (len(mix) - 1)
+    return [w / total for w in weighted]
+
+
+def blended_scan_multiplier(p: TokenomicsParams, month: int | None = None) -> float:
+    """
+    Volume-weighted average C2 scan multiplier. Reporting metric only — the
+    actual payout uses blended_effective_rate(), which is NOT base × this
+    value once the hard cap starts binding.
+    """
+    if not p.enable_tier_multipliers:
+        return 1.0
+    shares = tier_volume_shares(p, month)
+    return sum(shares[i] * C2_SCAN_MULT[i] for i in range(len(shares)))
+
+
+def blended_effective_rate(p: TokenomicsParams,
+                           base_rate: float,
+                           month: int | None = None) -> float:
+    """
+    Volume-weighted effective $AVA per new scan, with the hard cap binding LAST:
+
+        paid_i    = min(base_rate × mult_i, hard_cap)      per tier
+        effective = Σ share_i × paid_i
+
+    Cap-binds-last is the deliberate choice (see supervisor feedback, C2 pt 2):
+    the hard cap is a true ceiling on what any single scan can pay, so C2
+    multipliers can never breach C1's budget guardrail. Note the consequence —
+    when base_rate ≥ hard_cap, every tier is capped and the multipliers cost
+    nothing; they only bite once base_rate falls below the cap (i.e. as volume
+    grows), which is exactly when the budget is tightest.
+    """
+    cap = float(p.hard_cap_new_scan)
+    if not p.enable_tier_multipliers:
+        return min(base_rate, cap)
+    shares = tier_volume_shares(p, month)
+    return sum(
+        shares[i] * min(base_rate * C2_SCAN_MULT[i], cap)
+        for i in range(len(shares))
+    )
+
 
 def derive_metrics(p: TokenomicsParams) -> DerivedMetrics:
     """
@@ -263,6 +379,13 @@ def derive_metrics(p: TokenomicsParams) -> DerivedMetrics:
     eff_new = min(base_new, float(p.hard_cap_new_scan))
     eff_dup = eff_new / max(p.dup_divisor, 1.0)
 
+    # --- Blend across C2 tier multipliers (cap binds last) ---
+    # Steady-state mix (month=None) — the simulation re-blends per month so the
+    # tier ramp is reflected over time.
+    blended_mult = blended_scan_multiplier(p, None)
+    blended_new  = blended_effective_rate(p, base_new, None)
+    blended_dup  = blended_new / max(p.dup_divisor, 1.0)
+
     # --- Testnet rates ---
     tn_new = base_new * p.testnet_alpha
     tn_dup = base_dup * p.testnet_alpha
@@ -289,6 +412,10 @@ def derive_metrics(p: TokenomicsParams) -> DerivedMetrics:
         effective_new_scan_tokens = eff_new,
         effective_dup_tokens      = eff_dup,
         effective_new_scan_eur    = eff_new * p.token_price_eur,
+        blended_scan_mult         = blended_mult,
+        blended_new_scan_tokens   = blended_new,
+        blended_dup_tokens        = blended_dup,
+        blended_new_scan_eur      = blended_new * p.token_price_eur,
         tn_new_scan_tokens        = tn_new,
         tn_dup_tokens             = tn_dup,
         tn_monthly_budget_m       = tn_monthly_budget_m,
@@ -354,7 +481,10 @@ def run_simulation(p: TokenomicsParams, d: DerivedMetrics, n_months: int = 36) -
     mvt_tokens = d.mvt_m * 1_000_000.0
     mms_tokens = d.mms_m * 1_000_000.0
 
-    # Hard-capped scan rates (applied BEFORE the soft cap and BEFORE floor)
+    # Hard-capped scan rates (applied BEFORE the soft cap and BEFORE floor).
+    # NOTE: with C2 multipliers enabled these are re-blended per month inside
+    # the loop (tier population ramps up over time), so they act as the
+    # month-0 / multipliers-off baseline here.
     hc_new_rate = min(d.base_new_scan_tokens, float(p.hard_cap_new_scan))
     hc_dup_rate = hc_new_rate / max(p.dup_divisor, 1.0)
 
@@ -392,19 +522,28 @@ def run_simulation(p: TokenomicsParams, d: DerivedMetrics, n_months: int = 36) -
 
         catalog = min(catalog + new_scans, float(universe_n))
 
+        # ---- 1c. C2 tier blend for this month (cap binds last) ----
+        # The tier population ramps upward over time, so the blended rate — and
+        # therefore the cost of a scan — drifts up even at constant volume.
+        month_new_rate = blended_effective_rate(p, d.base_new_scan_tokens, month)
+        month_dup_rate = month_new_rate / max(p.dup_divisor, 1.0)
+        month_mult     = blended_scan_multiplier(p, month)
+
         # ---- 2. Hard cap savings (tokens not paid out → flow to RC) ----
-        # This is the difference between what the pool rate would pay and what the hard cap allows.
+        # Difference between what the pool rate would pay and what is actually
+        # paid after multipliers and the hard cap. Multipliers consume this
+        # headroom, so savings shrink as the population matures.
         uncapped_new = d.base_new_scan_tokens
         uncapped_dup = d.base_dup_tokens
         hc_savings = max(0.0, (
-            (uncapped_new - hc_new_rate) * new_scans
-            + (uncapped_dup - hc_dup_rate) * dup_scans
+            (uncapped_new - month_new_rate) * new_scans
+            + (uncapped_dup - month_dup_rate) * dup_scans
         ))   # in raw tokens
 
-        # ---- 3. Scan accruals at hard-capped rates ----
+        # ---- 3. Scan accruals at blended, hard-capped rates ----
         raw_scan_accruals = (
-            new_scans * hc_new_rate
-            + dup_scans * hc_dup_rate
+            new_scans * month_new_rate
+            + dup_scans * month_dup_rate
         )
 
         # ---- 4. Total monthly accruals ----
@@ -423,8 +562,8 @@ def run_simulation(p: TokenomicsParams, d: DerivedMetrics, n_months: int = 36) -
         actual_scan_spend = raw_scan_accruals * scaling
 
         # ---- 7. Effective per-scan rate (soft-cap-scaled, then floor-clamped) ----
-        eff_new_scan = max(hc_new_rate * scaling, float(p.floor_new_scan))
-        eff_dup      = max(hc_dup_rate * scaling, p.floor_new_scan / max(p.dup_divisor, 1.0))
+        eff_new_scan = max(month_new_rate * scaling, float(p.floor_new_scan))
+        eff_dup      = max(month_dup_rate * scaling, p.floor_new_scan / max(p.dup_divisor, 1.0))
         eff_new_eur  = eff_new_scan * p.token_price_eur
 
         # ---- 8. RC dynamics ----
@@ -443,6 +582,9 @@ def run_simulation(p: TokenomicsParams, d: DerivedMetrics, n_months: int = 36) -
             "Dup Scans":               int(dup_scans),
             "Catalog Size":            int(catalog),
             "Coverage %":              round(100.0 * catalog / universe_n, 2),
+            # C2 tier blend
+            "Blended Tier Mult":       round(month_mult, 3),
+            "Blended New Rate":        round(month_new_rate, 1),
             # Token flows (millions)
             "Scan Accruals (M)":       round(raw_scan_accruals / 1e6, 3),
             "Total Accruals (M)":      round(total_accruals    / 1e6, 3),
@@ -691,6 +833,66 @@ def fig_volume_profile(sim_df: pd.DataFrame) -> go.Figure:
         legend=dict(orientation="h", y=-0.25),
         margin=dict(t=55, b=80, l=65, r=20),
         height=340,
+    )
+    return fig
+
+
+def fig_tier_multiplier_curve(sim_df: pd.DataFrame, p: TokenomicsParams,
+                              d: DerivedMetrics) -> go.Figure:
+    """
+    Dual-axis chart for the C2 tier-multiplier blend:
+      Left axis  — blended volume-weighted multiplier as the population matures.
+      Right axis — resulting blended $AVA per new scan, vs the flat-rate
+                   (multipliers-off) baseline and the hard cap.
+
+    Makes the two effects visible: the ramp (cost drifts up at constant volume)
+    and cap saturation (the gap between blended and flat collapses to zero
+    whenever the pool rate sits above the hard cap).
+    """
+    flat_rate = min(d.base_new_scan_tokens, float(p.hard_cap_new_scan))
+
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+    fig.add_trace(go.Scatter(
+        x=sim_df["Month"], y=sim_df["Blended Tier Mult"],
+        mode="lines+markers", name="Blended tier multiplier",
+        line=dict(color=COLORS["contributor"], width=2.5), marker=dict(size=4),
+        hovertemplate="Month %{x}<br>Blended mult: %{y:.3f}×<extra></extra>",
+    ), secondary_y=False)
+
+    fig.add_trace(go.Scatter(
+        x=sim_df["Month"], y=sim_df["Blended New Rate"],
+        mode="lines", name="Blended $AVA / new scan",
+        line=dict(color=COLORS["scan"], width=2.5),
+        hovertemplate="Month %{x}<br>%{y:,.0f} $AVA<extra></extra>",
+    ), secondary_y=True)
+
+    fig.add_trace(go.Scatter(
+        x=sim_df["Month"], y=[flat_rate] * len(sim_df),
+        mode="lines", name="Flat rate (multipliers off)",
+        line=dict(color=COLORS["neutral"], width=1.5, dash="dot"),
+        hovertemplate="Flat: %{y:,.0f} $AVA<extra></extra>",
+    ), secondary_y=True)
+
+    fig.add_hline(
+        y=p.hard_cap_new_scan, line_dash="dash", line_color=COLORS["mms"],
+        opacity=0.8, secondary_y=True,
+        annotation_text=f"Hard cap = {p.hard_cap_new_scan:,}",
+        annotation_position="top right",
+        annotation_font_color=COLORS["mms"],
+    )
+
+    fig.update_yaxes(title_text="Blended multiplier (×)", secondary_y=False)
+    fig.update_yaxes(title_text="$AVA per new scan", secondary_y=True,
+                     rangemode="tozero")
+    fig.update_layout(
+        title=("C2 Tier Multiplier Blend — Cost Drift as the Population Matures"
+               if p.enable_tier_multipliers else
+               "C2 Tier Multipliers — DISABLED (flat-rate pricing)"),
+        xaxis_title="Month",
+        legend=dict(orientation="h", y=-0.25),
+        margin=dict(t=55, b=80, l=65, r=75),
+        height=360,
     )
     return fig
 
@@ -1005,6 +1207,19 @@ def build_rate_table(p: TokenomicsParams, d: DerivedMetrics) -> pd.DataFrame:
             "Notes":              f"min(pool rate, hard cap {p.hard_cap_new_scan:,}); this is what contributors earn",
         },
         {
+            "Action":             "New scan — blended rate (C2 tiers applied)",
+            "Category":           "Scan-to-Earn",
+            "$AVA (base)":        f"{d.blended_new_scan_tokens:,.0f}",
+            "EUR at ICO":         f"€{d.blended_new_scan_eur:.2f}",
+            "Testnet $AVA (α)":   f"{d.blended_new_scan_tokens * p.testnet_alpha:,.0f}",
+            "Notes":              (
+                f"Volume-weighted across C2 tiers (blended {d.blended_scan_mult:.2f}×), "
+                f"hard cap applied per tier LAST — this is the true average cost"
+                if p.enable_tier_multipliers else
+                "C2 multipliers disabled — equals the effective rate above"
+            ),
+        },
+        {
             "Action":             "Duplicate scan (verification)",
             "Category":           "Scan-to-Earn",
             "$AVA (base)":        f"{d.base_dup_tokens:,.1f}",
@@ -1094,26 +1309,49 @@ RAFFLE_CONS_PP_FLOOR = 80
 RAFFLE_CONS_PP_CEIL  = 2_000
 
 # --- Pity mechanism (C6 §8) ---
-RAFFLE_PITY_THRESHOLD = 3        # consecutive losing draws → guaranteed Consolation slot
+# Revised 3 → 2 in July 2026. The original threshold assumed a 90-day ticket
+# expiry; once expiry was set to 60 days, a three-month losing streak outlived
+# the tickets earned at its start. Two draws keeps the guarantee inside the
+# ticket lifetime.
+RAFFLE_PITY_THRESHOLD = 2        # consecutive losing draws → guaranteed Consolation slot
+
+# --- Ticket expiry (C6 §4) ---
+RAFFLE_TICKET_EXPIRY_DAYS = 60   # rolling FIFO; uncommitted tickets burn after this
+RAFFLE_DRAW_PERIOD_DAYS   = 30   # monthly draw cadence
 
 # --- Default user-profile tier mix (Component-2 tiers) ---
 # tickets_per_month is calibrated from C6 §3.2: Scout (1.0×) ≈ 2,650/mo,
 # Legend (3.0×) ≈ 6,000–7,500/mo. Intermediate tiers interpolated.
+# ALIGNED to the six Component-2 tiers (July 2026). The previous four-profile
+# ladder (Scout / Explorer / Pathfinder / Legend at 1.0–3.0×) matched neither
+# C2 nor C6 — "Explorer" and "Pathfinder" are not C2 tier names at all
+# (Explorer is a per-track L2 badge, the likely source of the collision).
+# Raffle multipliers below are the C2 §5.2 values, confirmed canonical against
+# C6 §3.2, which cites Scout 1.0× and Legend 3.0× as its calibration endpoints.
+# Tickets/mo = C6 §3.2 Scout baseline (2,650) × the tier's raffle multiplier,
+# with Legend held at the top of C6's stated 6,000–7,500 band.
 RAFFLE_DEFAULT_PROFILES = [
-    {"Profile": "Scout (1.0×)",      "% of users": 55.0, "Tickets/mo": 2650},
-    {"Profile": "Explorer (1.5×)",   "% of users": 25.0, "Tickets/mo": 3975},
-    {"Profile": "Pathfinder (2.0×)", "% of users": 15.0, "Tickets/mo": 5300},
-    {"Profile": "Legend (3.0×)",     "% of users":  5.0, "Tickets/mo": 7000},
+    {"Profile": "Scout (1.0×)",     "% of users": 40.0, "Tickets/mo": 2650},
+    {"Profile": "Taster (1.2×)",    "% of users": 25.0, "Tickets/mo": 3180},
+    {"Profile": "Collector (1.5×)", "% of users": 18.0, "Tickets/mo": 3975},
+    {"Profile": "Analyst (2.0×)",   "% of users": 10.0, "Tickets/mo": 5300},
+    {"Profile": "Expert (2.5×)",    "% of users":  5.0, "Tickets/mo": 6625},
+    {"Profile": "Legend (3.0×)",    "% of users":  2.0, "Tickets/mo": 7500},
 ]
 
 # Per-tier seed for the monthly long-format grid. Higher tiers are assumed to
 # commit at higher rates (more engaged). All values are user-editable per month.
-RAFFLE_TIER_NAMES = ["Scout (1.0×)", "Explorer (1.5×)", "Pathfinder (2.0×)", "Legend (3.0×)"]
+RAFFLE_TIER_NAMES = [
+    "Scout (1.0×)", "Taster (1.2×)", "Collector (1.5×)",
+    "Analyst (2.0×)", "Expert (2.5×)", "Legend (3.0×)",
+]
 RAFFLE_TIER_SEED = [
-    {"Tier": "Scout (1.0×)",      "Profile (%)": 55.0, "Tickets": 2650, "Commit Rate (%)": 45.0},
-    {"Tier": "Explorer (1.5×)",   "Profile (%)": 25.0, "Tickets": 3975, "Commit Rate (%)": 60.0},
-    {"Tier": "Pathfinder (2.0×)", "Profile (%)": 15.0, "Tickets": 5300, "Commit Rate (%)": 72.0},
-    {"Tier": "Legend (3.0×)",     "Profile (%)":  5.0, "Tickets": 7000, "Commit Rate (%)": 85.0},
+    {"Tier": "Scout (1.0×)",     "Profile (%)": 40.0, "Tickets": 2650, "Commit Rate (%)": 45.0},
+    {"Tier": "Taster (1.2×)",    "Profile (%)": 25.0, "Tickets": 3180, "Commit Rate (%)": 55.0},
+    {"Tier": "Collector (1.5×)", "Profile (%)": 18.0, "Tickets": 3975, "Commit Rate (%)": 62.0},
+    {"Tier": "Analyst (2.0×)",   "Profile (%)": 10.0, "Tickets": 5300, "Commit Rate (%)": 72.0},
+    {"Tier": "Expert (2.5×)",    "Profile (%)":  5.0, "Tickets": 6625, "Commit Rate (%)": 80.0},
+    {"Tier": "Legend (3.0×)",    "Profile (%)":  2.0, "Tickets": 7500, "Commit Rate (%)": 85.0},
 ]
 
 
@@ -1135,14 +1373,24 @@ def fmt_ava(v: float, decimals_k: int = 1, decimals_m: int = 2) -> str:
     return f"{v:,.0f}"
 
 
-def pity_eligible_fraction(p_win: float) -> float:
+def pity_eligible_fraction(p_win: float, threshold: int = RAFFLE_PITY_THRESHOLD) -> float:
     """
-    Stationary fraction of committers in pity-state 3 (C6 §8.2).
-    Markov chain where state 3 absorbs into state 0 via the guaranteed win:
-        π_3 = q³ / (1 + q + q² + q³),   q = 1 − p_win
+    Stationary fraction of committers sitting at the pity threshold (C6 §8.2).
+
+    Markov chain on the consecutive-loss counter 0…T, where reaching T absorbs
+    back into 0 via the guaranteed win:
+
+        π_T = q^T / Σ(k=0..T) q^k ,    q = 1 − p_win
+
+    Generalised over the threshold T (was hardcoded to 3; C6 revised it to 2 in
+    July 2026, so this now scales with RAFFLE_PITY_THRESHOLD). A lower threshold
+    puts MORE users in the pity state — the guarantee fires more often, which
+    raises the Consolation-tier load.
     """
     q = max(0.0, min(1.0, 1.0 - p_win))
-    return q ** 3 / (1.0 + q + q ** 2 + q ** 3)
+    T = max(1, int(threshold))
+    denom = sum(q ** k for k in range(T + 1))
+    return (q ** T) / denom if denom > 0 else 0.0
 
 
 def compute_raffle_draw(
@@ -1259,6 +1507,9 @@ def run_raffle_simulation(
     mid_ceil: int = RAFFLE_MID_CEIL,
     cons_floor: int = RAFFLE_CONS_FLOOR,
     cons_ceil: int = RAFFLE_CONS_CEIL,
+    model_expiry: bool = True,
+    expiry_days: int = RAFFLE_TICKET_EXPIRY_DAYS,
+    draw_period_days: int = RAFFLE_DRAW_PERIOD_DAYS,
 ) -> pd.DataFrame:
     """
     Build the month-by-month raffle simulation from the long-format grid.
@@ -1270,9 +1521,34 @@ def run_raffle_simulation(
         tier_users      = N_users × Profile% / 100        (Profile% normalised to sum 100)
         tier_committers = tier_users × CommitRate% / 100
         N_active        = Σ tier_committers
-        T               = Σ tier_committers × tier_tickets
+
+    Ticket balance model (C6 §4) — model_expiry=True
+    ------------------------------------------------
+    Tickets are NOT use-it-or-lose-it within the month. Uncommitted tickets stay
+    in the user's balance and expire only after `expiry_days`, rolling FIFO
+    (oldest committed first). Each tier therefore carries a balance split into
+    monthly vintages:
+
+        survive_periods = round(expiry_days / draw_period_days)     # 60/30 → 2
+
+      1. Earn:    this month's tickets are added as the newest vintage.
+      2. Commit:  committers draw from the balance oldest-first. Aggregated as
+                  committed = commit_rate × total_balance (balance assumed
+                  evenly spread across the tier's users).
+      3. Expire:  vintages older than survive_periods are burned.
+
+    T (the committed ticket pool) is therefore LARGER than one month's earnings
+    once carry-over builds up — which lowers each individual's win probability
+    even though the prize budget is unchanged.
+
+    model_expiry=False reproduces the legacy behaviour, where each month is
+    independent and T = Σ committers × tier_tickets.
     """
+    survive_periods = max(1, int(round(expiry_days / max(draw_period_days, 1))))
+
     rows = []
+    tier_balances: dict[str, list] = {}    # tier name → vintages, index 0 = newest
+
     for month, g in grid_df.groupby("Month", sort=True):
         n_users = float(g["N Users"].iloc[0])                       # monthly total (first row)
 
@@ -1282,11 +1558,43 @@ def run_raffle_simulation(
 
         n_active = 0.0
         total_T = 0.0
+        earned_total = 0.0
+        expired_total = 0.0
+        carried_total = 0.0
+
         for (_, r), share in zip(g.iterrows(), shares):
+            tier_name       = str(r["Tier"])
             tier_users      = n_users * float(share)
-            tier_committers = tier_users * float(r["Commit Rate (%)"]) / 100.0
+            commit_frac     = float(r["Commit Rate (%)"]) / 100.0
+            tier_committers = tier_users * commit_frac
             n_active += tier_committers
-            total_T  += tier_committers * float(r["Tickets"])
+
+            earned = tier_users * float(r["Tickets"])
+            earned_total += earned
+
+            if not model_expiry:
+                total_T += tier_committers * float(r["Tickets"])
+                continue
+
+            bal = tier_balances.setdefault(tier_name, [])
+            bal.insert(0, earned)                       # newest vintage first
+
+            # --- commit, oldest-first (FIFO) ---
+            committed = sum(bal) * commit_frac
+            remaining = committed
+            i = len(bal) - 1
+            while remaining > 1e-9 and i >= 0:
+                take = min(bal[i], remaining)
+                bal[i] -= take
+                remaining -= take
+                i -= 1
+            total_T += committed
+
+            # --- expire vintages beyond the window ---
+            if len(bal) > survive_periods:
+                expired_total += sum(bal[survive_periods:])
+                del bal[survive_periods:]
+            carried_total += sum(bal)
 
         rec = compute_raffle_draw(
             n_active=n_active, total_tickets_T=total_T,
@@ -1294,8 +1602,11 @@ def run_raffle_simulation(
             mid_floor=mid_floor, mid_ceil=mid_ceil,
             cons_floor=cons_floor, cons_ceil=cons_ceil,
         )
-        rec["Month"]   = int(month)
-        rec["N Users"] = int(n_users)
+        rec["Month"]            = int(month)
+        rec["N Users"]          = int(n_users)
+        rec["Tickets Earned"]   = int(earned_total)
+        rec["Tickets Expired"]  = int(expired_total)
+        rec["Balance Carried"]  = int(carried_total)
         rows.append(rec)
 
     return pd.DataFrame(rows).sort_values("Month").reset_index(drop=True)
@@ -1634,6 +1945,69 @@ def render_sidebar() -> TokenomicsParams:
     )
 
     # ---- Price & Floor ------------------------------------------
+    # ----------------------------------------------------------------------
+    st.sidebar.header("🎚️ Component 2 Tier Multipliers")
+    st.sidebar.caption(
+        "C2 grants higher-level contributors a 1.00×–2.00× scan multiplier. "
+        "The hard cap binds LAST (on the final paid amount), so no tier can "
+        "ever be paid above it."
+    )
+
+    enable_tier_multipliers = st.sidebar.checkbox(
+        "Apply C2 scan multipliers", value=True,
+        help="Off = legacy flat-rate pricing (every scan costs the same "
+             "regardless of contributor level).",
+    )
+
+    tier_ramp_months = st.sidebar.slider(
+        "Tier ramp (months)", min_value=0, max_value=36, value=12,
+        help="Months for the population to migrate from all-Scout at launch to "
+             "the steady mix below. Tiers only ratchet upward (XP never "
+             "decays), so the blended multiplier — and the cost per scan — "
+             "drifts up over time. 0 = start at the steady mix immediately.",
+        disabled=not enable_tier_multipliers,
+    )
+
+    tier_df = pd.DataFrame({
+        "Tier":        C2_TIER_NAMES,
+        "Scan mult":   C2_SCAN_MULT,
+        "% of users":  list(C2_DEFAULT_MIX),
+        "Scans/user":  list(C2_DEFAULT_INTENSITY),
+    })
+    edited_tiers = st.sidebar.data_editor(
+        tier_df,
+        hide_index=True,
+        disabled=["Tier", "Scan mult"] if enable_tier_multipliers
+                 else ["Tier", "Scan mult", "% of users", "Scans/user"],
+        column_config={
+            "Scan mult": st.column_config.NumberColumn(
+                format="%.2f×",
+                help="Locked to the C2 spec.",
+            ),
+            "% of users": st.column_config.NumberColumn(
+                format="%.1f%%", min_value=0.0, max_value=100.0,
+                help="Steady-state population share of this tier.",
+            ),
+            "Scans/user": st.column_config.NumberColumn(
+                format="%.1f", min_value=0.0,
+                help="Relative scans per user per month. Cost is VOLUME-"
+                     "weighted, so high tiers count more than their headcount.",
+            ),
+        },
+        key="c2_tier_editor",
+    )
+    tier_mix_pct        = tuple(float(v) for v in edited_tiers["% of users"])
+    tier_scan_intensity = tuple(float(v) for v in edited_tiers["Scans/user"])
+
+    if enable_tier_multipliers:
+        _mix_total = sum(tier_mix_pct)
+        if abs(_mix_total - 100.0) > 0.5:
+            st.sidebar.warning(
+                f"⚠️ Tier mix sums to {_mix_total:.1f}% — shares are "
+                "renormalised, but check this is intended."
+            )
+
+    # ----------------------------------------------------------------------
     st.sidebar.header("💶 Price & Floor")
 
     token_price_eur = st.sidebar.number_input(
@@ -1718,6 +2092,10 @@ def render_sidebar() -> TokenomicsParams:
         new_scans_monthly   = new_scans_monthly,
         dup_scans_monthly   = dup_scans_monthly,
         dup_divisor         = dup_divisor,
+        enable_tier_multipliers = enable_tier_multipliers,
+        tier_mix_pct            = tier_mix_pct,
+        tier_scan_intensity     = tier_scan_intensity,
+        tier_ramp_months        = int(tier_ramp_months),
         dup_model           = dup_model,
         item_universe_n     = int(item_universe_n),
         initial_catalog_items = int(initial_catalog_items),
@@ -1889,8 +2267,10 @@ def main():
             # back-calculated from the scan budget, so base-rate cost ≡ budget
             # (always exactly 100%), which made this check meaningless and let
             # floating-point noise flip it to a false "OVER budget" warning.
-            new_cost_m  = params.new_scans_monthly * metrics.effective_new_scan_tokens / 1e6
-            dup_cost_m  = params.dup_scans_monthly  * metrics.effective_dup_tokens      / 1e6
+            # Uses BLENDED rates so C2 tier multipliers are reflected in the
+            # budget check (supervisor feedback, C2 point 2).
+            new_cost_m  = params.new_scans_monthly * metrics.blended_new_scan_tokens / 1e6
+            dup_cost_m  = params.dup_scans_monthly  * metrics.blended_dup_tokens      / 1e6
             total_scan_m = new_cost_m + dup_cost_m
             utilisation  = total_scan_m / max(metrics.scan_budget_m, 0.001) * 100
 
@@ -1943,6 +2323,12 @@ def main():
         # Coverage curve (only meaningful for the coverage-based dup model)
         if params.dup_model == "coverage":
             st.plotly_chart(fig_coverage_curve(sim_df, params), use_container_width=True)
+
+        # C2 tier-multiplier blend over time
+        st.plotly_chart(
+            fig_tier_multiplier_curve(sim_df, params, metrics),
+            use_container_width=True,
+        )
 
         # Scan reward curve
         st.plotly_chart(
@@ -2017,20 +2403,52 @@ def main():
         cons_ceil  = wc4.number_input("Consolation winners — ceiling", min_value=int(cons_floor), max_value=1_000_000,
                                       value=max(RAFFLE_CONS_CEIL, int(cons_floor)), step=100)
 
-        # ---- Per-month scenario grid (long format: 4 tier rows per month) ----
+        # ---- Ticket lifecycle (C6 §4) ----
+        st.markdown("**Ticket lifecycle**")
+        ec1, ec2, ec3 = st.columns([1.4, 1, 1])
+        model_expiry = ec1.checkbox(
+            "Model ticket carry-over & expiry", value=True,
+            help="On: uncommitted tickets stay in the user's balance and expire "
+                 "only after the window below, rolling FIFO (C6 §4). "
+                 "Off: legacy behaviour — each month is independent and "
+                 "uncommitted tickets simply vanish.",
+        )
+        expiry_days = ec2.number_input(
+            "Ticket expiry (days)", min_value=30, max_value=365,
+            value=RAFFLE_TICKET_EXPIRY_DAYS, step=30,
+            help="C6 §4: 60 days from issuance, rolling FIFO.",
+            disabled=not model_expiry,
+        )
+        ec3.metric(
+            "Pity threshold",
+            f"{RAFFLE_PITY_THRESHOLD} losing draws",
+            help="C6 §8, revised 3 → 2 in July 2026 so the guarantee lands "
+                 "inside the 60-day ticket window. A lower threshold puts more "
+                 "users in the pity state, raising Consolation-tier load.",
+        )
+        if model_expiry:
+            _sp = max(1, int(round(expiry_days / RAFFLE_DRAW_PERIOD_DAYS)))
+            st.caption(
+                f"A ticket survives **{_sp} draw(s)** at a {RAFFLE_DRAW_PERIOD_DAYS}-day cadence. "
+                f"Carry-over makes the committed pool T larger than one month's earnings, "
+                f"which lowers each committer's win probability at an unchanged prize budget."
+            )
+
+        # ---- Per-month scenario grid (long format: 6 tier rows per month) ----
         st.markdown("**Per-month scenario grid — single source of truth.**")
         st.info(
-            "This grid **overrides** the seed inputs above. Each month has **four tier rows** "
-            "(Scout → Legend). Edit them to model month-specific scenarios:\n\n"
+            "This grid **overrides** the seed inputs above. Each month has **six tier rows** "
+            "(Scout → Legend, per Component 2 §5.2). Edit them to model month-specific scenarios:\n\n"
             "- **N Users** — total active users that month (a per-month value; edit it on the "
-            "first tier row of the month, it applies to all four).\n"
-            "- **Profile (%)** — that month's share of users in each tier. The four values "
+            "first tier row of the month, it applies to all six).\n"
+            "- **Profile (%)** — that month's share of users in each tier. The six values "
             "**should sum to 100%** per month (auto-normalised if not).\n"
             "- **Tickets** — monthly tickets earned by a user in that tier (engagement-driven; "
             "scanning earns none).\n"
             "- **Commit Rate (%)** — share of that tier's users who commit ≥1 ticket to the draw.\n\n"
-            "Per month: `N_active = Σ tier_users × commit_rate`, and the committed ticket pool "
-            "`T = Σ tier_committers × tier_tickets`.",
+            "Per month: `N_active = Σ tier_users × commit_rate`. The committed pool `T` is drawn "
+            "from each tier's running ticket balance when expiry is modelled, or equals "
+            "`Σ tier_committers × tier_tickets` when it is not.",
             icon="🧭",
         )
 
@@ -2075,7 +2493,30 @@ def main():
             grid_df, raffle_pool_tokens,
             mid_floor=int(mid_floor), mid_ceil=int(mid_ceil),
             cons_floor=int(cons_floor), cons_ceil=int(cons_ceil),
+            model_expiry=bool(model_expiry),
+            expiry_days=int(expiry_days),
         )
+
+        # ---- Ticket lifecycle summary ----
+        if model_expiry and "Tickets Expired" in raffle_df.columns:
+            lc1, lc2, lc3 = st.columns(3)
+            _earned = raffle_df["Tickets Earned"].sum()
+            _expired = raffle_df["Tickets Expired"].sum()
+            lc1.metric("Tickets earned (total)", f"{_earned:,.0f}")
+            lc2.metric(
+                "Tickets expired unused", f"{_expired:,.0f}",
+                delta=f"{(100 * _expired / _earned if _earned else 0):.1f}% of earned",
+                delta_color="inverse",
+                help="Tickets burned before their holder committed them. A high "
+                     "share suggests the expiry window is too tight, or commit "
+                     "rates are too low for the tickets being issued.",
+            )
+            lc3.metric(
+                "Balance carried (final month)",
+                f"{raffle_df['Balance Carried'].iloc[-1]:,.0f}",
+                help="Unexpired, uncommitted tickets still in user balances at "
+                     "the end of the simulation window.",
+            )
 
         st.markdown("---")
 

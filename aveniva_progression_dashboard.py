@@ -81,8 +81,12 @@ TRACKS = [
 
 # ---- Per-track level thresholds (cumulative XP within that track) ----
 # Standard = 6 tracks; Elite = 4 tracks
-STANDARD_THRESH = [0, 500,   2_000,  6_000,  15_000]   # L1 – L5
-ELITE_THRESH    = [0, 800,   3_500,  10_000, 25_000]    # L1 – L5
+# Updated to C2 spec v1.1 (July 2026): L2–L4 lowered for faster early
+# progression. L5 values deliberately UNCHANGED — the sum of the ten L5
+# thresholds sets the theoretical XP ceiling (6×15,000 + 4×25,000 = 190,000),
+# and the overall curve below is calibrated to fit beneath it.
+STANDARD_THRESH = [0, 300,   1_200,  4_000,  15_000]   # L1 – L5
+ELITE_THRESH    = [0, 500,   2_000,  6_500,  25_000]    # L1 – L5
 LEVEL_LABELS    = ["L1", "L2", "L3", "L4", "L5"]
 
 def track_thresh(track: dict) -> list:
@@ -90,38 +94,56 @@ def track_thresh(track: dict) -> list:
 
 # ---- Overall level thresholds (total XP across all tracks) ----
 # 30 values; index i → Level (i+1)
+#
+# RECALIBRATED for C2 spec v1.1 (July 2026). The v1.0 curve topped out at
+# 1,160,000 XP, which was BOTH unreachable in principle (above the 190,000
+# track-XP ceiling) and impossibly slow in practice (~97 months at power-user
+# velocity). The v1.1 curve is generated from a single parametric form —
+#
+#     total XP to reach level L  =  K · L^2.5,   K chosen so L30 = 130,000
+#
+# — then rounded to readable values. Design targets:
+#   • Reachability: L30 sits 32% below the 190,000 ceiling (60,000 XP slack).
+#   • Pacing:       ~11 months to L30 at ~12,000 XP/mo (power user),
+#                   ~29 months at ~4,500 XP/mo (active daily scanner).
+# To retune, change the L30 target and regenerate — do not hand-edit rows,
+# or the curve stops being smooth.
 OVERALL_XP = [
           0,   # L1  ── Scout ──
-        250,   # L2
-        600,   # L3
-      1_200,   # L4
-      2_200,   # L5
-      3_700,   # L6  ── Taster ──
-      5_700,   # L7
-      8_200,   # L8
-     11_500,   # L9
-     15_500,   # L10
-     21_000,   # L11 ── Collector ──
-     28_000,   # L12
-     37_000,   # L13
-     48_500,   # L14
-     63_000,   # L15
-     81_000,   # L16 ── Analyst ──
-    103_000,   # L17
-    130_000,   # L18
-    162_000,   # L19
-    200_000,   # L20
-    245_000,   # L21 ── Expert ──
-    298_000,   # L22
-    360_000,   # L23
-    432_000,   # L24
-    515_000,   # L25
-    610_000,   # L26 ── Legend ──
-    720_000,   # L27
-    847_000,   # L28
-    993_000,   # L29
-  1_160_000,   # L30
+        150,   # L2
+        400,   # L3
+        850,   # L4
+      1_500,   # L5
+      2_300,   # L6  ── Taster ──
+      3_400,   # L7
+      4_800,   # L8
+      6_400,   # L9
+      8_300,   # L10
+     10_600,   # L11 ── Collector ──
+     13_200,   # L12
+     16_000,   # L13
+     19_300,   # L14
+     23_000,   # L15
+     27_000,   # L16 ── Analyst ──
+     31_400,   # L17
+     36_200,   # L18
+     41_500,   # L19
+     47_200,   # L20
+     53_300,   # L21 ── Expert ──
+     59_900,   # L22
+     66_900,   # L23
+     74_400,   # L24
+     82_400,   # L25
+     90_900,   # L26 ── Legend ──
+     99_900,   # L27
+    109_400,   # L28
+    119_500,   # L29
+    130_000,   # L30
 ]
+
+# Theoretical XP ceiling if track XP stops accruing at L5. The overall curve
+# above must stay below this for the top levels to be reachable at all.
+TRACK_XP_CEILING = 6 * STANDARD_THRESH[4] + 4 * ELITE_THRESH[4]   # = 190,000
 
 # ---- 6 named tiers ----
 TIERS = [
@@ -446,14 +468,30 @@ def fig_time_to_level() -> go.Figure:
 def fig_multiplier_combined(base_hard_cap: int = 250) -> go.Figure:
     """
     Dual-axis step chart:
-      Left  — scan reward multiplier (1.00× → 2.00×) and effective $AVA cap
+      Left  — scan reward multiplier (1.00× → 2.00×)
       Right — raffle ticket multiplier (1.0× → 3.0×)
     Tier regions shaded. Step shape makes tier boundaries explicit.
+
+    CAP SEMANTICS (C2 spec v1.1, July 2026)
+    ---------------------------------------
+    The multiplier scales the per-scan REWARD; the hard cap is applied LAST,
+    to the final payout, and is a single global value:
+
+        per_scan_reward = min(pool_rate × scaling × tier_mult, hard_cap)
+
+    So every tier shares the same 250 $AVA ceiling — a Legend is never paid
+    more than a Scout's maximum. This replaces the v1.0 rule, which scaled the
+    cap itself (giving Legend a 500 $AVA ceiling) and is now withdrawn.
+
+    What the multiplier still changes is the pool rate at which each tier
+    REACHES the ceiling: hard_cap / tier_mult. A Legend caps out while the
+    pool rate is still 125 $AVA; a Scout only at 250.
     """
     levels       = list(range(1, 31))
     scan_mults   = [get_tier(l)["scan_mult"]          for l in levels]
     raffle_mults = [get_tier(l)["raffle_mult"]         for l in levels]
-    scan_caps    = [m * base_hard_cap                  for m in scan_mults]
+    # Pool rate at which this tier's payout first hits the global hard cap.
+    cap_reach    = [base_hard_cap / m                  for m in scan_mults]
     tier_colors  = [TIER_COLORS[get_tier(l)["name"]]  for l in levels]
 
     fig = make_subplots(specs=[[{"secondary_y": True}]])
@@ -484,18 +522,21 @@ def fig_multiplier_combined(base_hard_cap: int = 250) -> go.Figure:
         hovertemplate=(
             "Level %{x}<br>"
             "Scan mult: <b>%{y:.2f}×</b><br>"
-            "Effective cap: <b>%{customdata:,} $AVA</b><extra></extra>"
+            f"Payout ceiling: <b>{base_hard_cap:,} $AVA</b> (global, all tiers)<br>"
+            "Caps out at pool rate: <b>%{customdata:,.0f} $AVA</b><extra></extra>"
         ),
-        customdata=scan_caps,
+        customdata=cap_reach,
     ), secondary_y=False)
 
-    # Effective scan cap (dotted, hidden by default — toggle in legend)
+    # Pool rate at which each tier reaches the global cap (hidden by default).
+    # NOTE: this is NOT a per-tier cap — the ceiling is base_hard_cap for
+    # everyone. Lower value = reaches the ceiling sooner as volume grows.
     fig.add_trace(go.Scatter(
-        x=levels, y=scan_caps,
+        x=levels, y=cap_reach,
         mode="lines",
-        name=f"Effective scan cap ($AVA, base={base_hard_cap})",
+        name=f"Pool rate at which tier hits the {base_hard_cap:,} $AVA cap",
         line=dict(color="#5BAD8B", width=1.5, dash="dot", shape="hv"),
-        hovertemplate="Level %{x}<br>Scan cap: <b>%{y:,} $AVA</b><extra></extra>",
+        hovertemplate="Level %{x}<br>Caps out at pool rate: <b>%{y:,.0f} $AVA</b><extra></extra>",
         visible="legendonly",
     ), secondary_y=False)
 
@@ -524,47 +565,57 @@ def fig_multiplier_combined(base_hard_cap: int = 250) -> go.Figure:
     return fig
 
 
-def fig_scan_cap_bars(base_hard_cap: int = 250) -> go.Figure:
+def fig_scan_cap_bars(base_hard_cap: int = 250, pool_rate: float = 200.0) -> go.Figure:
     """
-    Bar chart: effective per-scan $AVA cap at each level.
-    Bars coloured by tier. Tier cap value annotated once per tier block.
+    Bar chart: actual per-scan $AVA payout at each level, for a given pool rate.
+
+    C2 spec v1.1 semantics — the cap binds LAST and is global:
+        payout(level) = min(pool_rate × tier_mult(level), base_hard_cap)
+
+    The flat red line is the shared ceiling. Where bars sit below it, the tier
+    multiplier is still doing work; where they touch it, that tier is capped
+    and further multiplier is worth nothing. Sweep `pool_rate` to see tiers
+    saturate from the top down as scan volume grows.
+
+    (v1.0 plotted mult × cap here, implying per-tier ceilings up to 500 $AVA.
+    That rule has been withdrawn.)
     """
-    levels    = list(range(1, 31))
-    caps      = [get_tier(l)["scan_mult"] * base_hard_cap for l in levels]
-    colors    = [TIER_COLORS[get_tier(l)["name"]]         for l in levels]
+    levels  = list(range(1, 31))
+    payouts = [min(pool_rate * get_tier(l)["scan_mult"], base_hard_cap) for l in levels]
+    colors  = [TIER_COLORS[get_tier(l)["name"]] for l in levels]
 
     fig = go.Figure()
     fig.add_trace(go.Bar(
-        x=levels, y=caps,
+        x=levels, y=payouts,
         marker_color=colors,
         hovertemplate=(
-            "Level %{x} (%{customdata})<br>"
-            "Scan cap: <b>%{y:,.0f} $AVA</b><extra></extra>"
+            "Level %{x} (%{customdata[0]})<br>"
+            "Multiplier: %{customdata[1]:.2f}×<br>"
+            "Payout: <b>%{y:,.0f} $AVA</b>%{customdata[2]}<extra></extra>"
         ),
-        customdata=[get_tier(l)["name"] for l in levels],
+        customdata=[
+            [get_tier(l)["name"], get_tier(l)["scan_mult"],
+             "  (at cap)" if pool_rate * get_tier(l)["scan_mult"] >= base_hard_cap else ""]
+            for l in levels
+        ],
         showlegend=False,
     ))
 
-    # Annotate one value per tier
-    for tier in TIERS:
-        ls, le  = tier["levels"]
-        cap_val = tier["scan_mult"] * base_hard_cap
-        color   = TIER_COLORS[tier["name"]]
-        fig.add_annotation(
-            x=(ls + le) / 2,
-            y=cap_val + base_hard_cap * 0.05,
-            text=f"<b>{cap_val:,.0f}</b>",
-            showarrow=False,
-            font=dict(size=11, color=color),
-        )
+    fig.add_hline(
+        y=base_hard_cap, line_dash="dash", line_color="#E94F37", line_width=2,
+        annotation_text=f"Global hard cap = {base_hard_cap:,} $AVA (all tiers)",
+        annotation_position="top left",
+        annotation_font_color="#E94F37",
+    )
 
     fig.update_layout(
-        title=f"Effective Per-Scan $AVA Cap by Level  (base = {base_hard_cap} $AVA)",
+        title=(f"Per-Scan $AVA Payout by Level  "
+               f"(pool rate = {pool_rate:,.0f}, cap = {base_hard_cap} $AVA)"),
         xaxis=dict(
             title="Overall level",
             tickmode="array", tickvals=list(range(1, 31, 2)),
         ),
-        yaxis_title="Max $AVA earned per new scan",
+        yaxis_title="$AVA earned per new scan",
         margin=dict(t=60, b=60, l=80, r=20),
         height=370,
     )
@@ -669,7 +720,8 @@ def render_calculator():
     m3.metric(
         "Scan multiplier",
         f"{tier['scan_mult']:.2f}×",
-        help="Multiplier applied to the base hard cap on per-scan $AVA rewards.",
+        help="Multiplier applied to the per-scan $AVA reward, BEFORE the global "
+             "hard cap is applied (C2 spec v1.1).",
     )
     m4.metric(
         "Raffle ticket multiplier",
@@ -677,9 +729,12 @@ def render_calculator():
         help="Raffle tickets earned per qualifying action are multiplied by this factor.",
     )
     m5.metric(
-        "Effective scan cap",
-        f"{int(tier['scan_mult'] * 250):,} $AVA",
-        help="Effective max $AVA per new scan at current tier (assumes base cap = 250 $AVA).",
+        "Caps out at pool rate",
+        f"{250 / tier['scan_mult']:,.0f} $AVA",
+        help="The payout ceiling is a global 250 $AVA for EVERY tier — this "
+             "multiplier does not raise it. What it changes is how early you "
+             "reach it: once the pool rate exceeds this value, your payout is "
+             "capped at 250 and further multiplier adds nothing.",
     )
 
     # ---- Progress bar to next overall level ----
@@ -844,16 +899,35 @@ def main():
     with tab_mult:
         st.markdown(
             "Both multipliers are **tier-based step functions** — they jump at levels 6, 11, 16, 21, and 26. "
-            "The **scan multiplier** scales the hard cap on per-scan $AVA (set in Component 1). "
-            "The **raffle multiplier** increases the tickets a contributor earns per qualifying action."
+            "The **scan multiplier** scales the per-scan $AVA reward, with Component 1's hard cap applied "
+            "**last** to the result. The **raffle multiplier** increases the tickets a contributor earns "
+            "per qualifying action."
+        )
+        st.info(
+            "**Cap semantics (C2 spec v1.1).**  `payout = min(pool_rate × tier_mult, hard_cap)` — "
+            "the hard cap is a **single global ceiling** that applies to every tier, so a Legend can "
+            "never be paid more per scan than the cap allows. The multiplier changes how *early* a tier "
+            "reaches that ceiling, not how high it is. "
+            "This supersedes the v1.0 rule, where the multiplier scaled the cap itself (Legend → 500 $AVA)."
         )
 
-        base_cap = st.number_input(
-            "Base hard cap ($AVA per new scan, from Component 1 dashboard)",
+        mc1, mc2 = st.columns(2)
+        base_cap = mc1.number_input(
+            "Hard cap ($AVA per new scan, from Component 1 dashboard)",
             min_value=50, max_value=10_000, value=250, step=10,
             help=(
-                "Adjust to see how all effective scan caps change proportionally across levels. "
+                "The global payout ceiling, applied after the tier multiplier. "
                 "Default 250 $AVA matches the Component 1 dashboard default."
+            ),
+        )
+        pool_rate = mc2.number_input(
+            "Pool rate ($AVA per new scan, before multiplier)",
+            min_value=10, max_value=10_000, value=200, step=10,
+            help=(
+                "Component 1's back-calculated scan rate, which falls as volume grows. "
+                "At the C1 default volume this is ~710 (every tier capped); by ~50k new "
+                "scans/month it is ~142 (multipliers doing real work). Sweep it to watch "
+                "tiers saturate from the top down."
             ),
         )
 
@@ -861,7 +935,7 @@ def main():
 
         c1, c2 = st.columns(2)
         with c1:
-            st.plotly_chart(fig_scan_cap_bars(base_cap), use_container_width=True)
+            st.plotly_chart(fig_scan_cap_bars(base_cap, pool_rate), use_container_width=True)
         with c2:
             st.plotly_chart(fig_raffle_bars(), use_container_width=True)
 

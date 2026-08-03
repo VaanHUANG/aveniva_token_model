@@ -103,6 +103,9 @@ DEFAULT_PARAMS = TokenomicsParams(
     spike_months=2,
     decay_months=4,
     testnet_chart_users=1_000,
+    # C2 tier multipliers ON by default — the flat-rate assumption understated
+    # scan cost (supervisor feedback, C2 point 2).
+    enable_tier_multipliers=True,
 )
 
 
@@ -132,6 +135,7 @@ def evaluate(p: TokenomicsParams,
     D = max(p.dup_divisor, 1.0)
 
     # --- True (uncapped) floor liability per month ---
+    # Reference quantity: what the floor guarantee alone obliges, ignoring rates.
     floor_liab_m = (
         p.floor_new_scan * sim["New Scans"]
         + (p.floor_new_scan / D) * sim["Dup Scans"]
@@ -141,8 +145,19 @@ def evaluate(p: TokenomicsParams,
     # model, but the treasury still owes raffle/contributor/quests at MVT rate).
     non_scan_m = (d.raffle_budget_m + d.contributor_budget_m + d.quests_budget_m)
 
-    # The TRUE monthly obligation = uncapped scan floor + non-scan budgets.
-    true_obligation_m = floor_liab_m + non_scan_m
+    # --- TRUE monthly scan payout ---
+    # Uses the simulation's own effective per-scan rates, which are
+    # max(blended_rate × soft_cap_scaling, floor) — so this captures BOTH the
+    # uncapped floor guarantee AND the C2 tier multipliers. Deriving this from
+    # the floor alone (as an earlier version did) understated the obligation
+    # whenever the paid rate sat above the floor.
+    true_scan_m = (
+        sim["New Scans"] * sim["Eff New Scan Tokens"]
+        + sim["Dup Scans"] * sim["Eff Dup Tokens"]
+    ) / 1e6
+
+    # The TRUE monthly obligation = actual scan payout + non-scan budgets.
+    true_obligation_m = true_scan_m + non_scan_m
 
     # The model's booked spend (soft-cap bounded).
     model_spend_m = sim["Actual Spend (M)"]
@@ -196,6 +211,7 @@ def evaluate(p: TokenomicsParams,
 
     detail = sim.copy()
     detail["True Floor Liab (M)"] = floor_liab_m.round(3)
+    detail["True Scan Payout (M)"] = true_scan_m.round(3)
     detail["True Obligation (M)"] = true_obligation_m.round(3)
     detail["Under-report vs model (M)"] = under_report_m.round(3)
     detail["RC Balance TRUE (M)"] = rc_path_true.round(3)
